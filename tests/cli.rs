@@ -789,8 +789,19 @@ fn the_command_names_are_the_final_surface_and_the_old_ones_are_gone() {
     // subcommand, which is distinct from every code this program defines.
     // `register` is deliberately absent from this list: it is upstream's name for
     // this same operation and it still works, which is the point of the mapping.
-    for gone in ["register-manager", "unregister-manager", "deregister"] {
-        let out = run(&sandbox, &[gone, "vortex", exec, "--", "%1"]);
+    //
+    // Each name is invoked at the arity it would have had, so that a surviving
+    // alias is rejected for being unknown rather than for taking the wrong
+    // number of arguments - which is the same exit 2 and a green test that
+    // proves nothing.
+    for (gone, args) in [
+        ("register-manager", vec!["vortex", exec, "--", "%1"]),
+        ("unregister-manager", vec!["vortex"]),
+        ("deregister", vec!["vortex"]),
+    ] {
+        let mut argv = vec![gone];
+        argv.extend(args.iter().copied());
+        let out = run(&sandbox, &argv);
         assert_eq!(
             code(&out),
             2,

@@ -211,12 +211,14 @@ install that routed nothing.
 >   `OSStatus`, so the suite makes **no** system call. The FFI is a three-line
 >   shell around it. This is the same split `windows.rs` already uses to keep
 >   `reg.exe` out of the tests.
-> * The two integration tests that run the real `install` accept a process
->   killed by a signal as "needs user", never as success, and print a note when
->   it happens. So **the macOS install path is not covered end to end**, and this
->   README does not claim it is. The assertion those tests still carry on macOS
->   is the one that matters most: nxmproxy never reports a claim it cannot
->   verify.
+> * The one integration test that still runs the real `install` on macOS
+>   accepts a process killed by a signal as "needs user", never as success, and
+>   prints a note when it happens. Every other assertion that would have needed
+>   a post-install state was moved to a test that runs on Linux and Windows
+>   instead, or re-expressed through `list --json`, which never calls `install`.
+>   So **the macOS install path is not covered end to end**, and this README
+>   does not claim it is. The assertion that still runs on macOS is the one that
+>   matters most: nxmproxy never reports a claim it cannot verify.
 
 `nxmproxy test` cannot report the current default handler without
 `LSCopyDefaultHandlerForURLScheme`, which this fork does not bind, so `test`
@@ -533,10 +535,11 @@ Every CLI test runs in a throwaway config directory and a throwaway
 >
 > **What it does not prove:** that `LSSetDefaultHandlerForURLScheme` makes macOS
 > offer the bundle, that the prompt appears, or that `reg.exe` writes the Windows
-> keys as intended. The `tests/cli.rs` round trip runs on all three platforms but
-> only performs the write where the platform allows it, so on macOS and Windows
-> it verifies the CLI contract and the exit codes rather than the OS
-> integration. Those need a real machine and a real click.
+> keys as intended. The `tests/cli.rs` round trip is compiled out on macOS,
+> because `install` is killed there before it prints anything; it runs on Linux
+> and Windows, verifying the CLI contract and the exit codes rather than the OS
+> integration. On macOS the detection decision is covered instead through
+> `list --json`. Those OS integrations need a real machine and a real click.
 >
 > This split is not hypothetical. The **first CI run of the claiming work failed
 > on all three platforms**, and every failure was one a Linux build could not
@@ -567,30 +570,35 @@ red. The controls are mutation-and-observe, not assertion-counting:
 | 1 | `install` force-propagates the claim into all three mimeapps files (GMM's anti-pattern) | `linux_install_claims_the_scheme_in_one_file_and_buries_nobody` |
 | 2 | the claim deletes another mod manager's lines | `the_fallback_claim_path_buries_nobody_either` |
 | 3 | `uninstall` deletes another manager's line | `linux_uninstall_removes_only_our_line` |
-| 4 | the file editor drops other lines | `set_default_ids_leaves_every_other_line_byte_for_byte` |
+| 4 | the file editor drops other lines | `setting_a_default_leaves_every_other_line_byte_for_byte` |
 | 5 | a claim that needs the user exits 0 | `only_a_verified_claim_exits_zero` |
 | 6 | `Claim::needs_user` reports a verified claim | `windows_never_reports_a_claim_it_could_not_make`, `a_claim_is_never_reported_as_verified` |
 | 7 | the "no manager, so nothing is routed" guard is removed | `install_never_calls_a_routing_setup_done` |
 | 8 | `register-manager` survives as an alias | `the_command_names_are_the_final_surface_and_the_old_ones_are_gone` |
 | 9 | the `$XDG_CONFIG_HOME` fix is removed, restoring `xdg-mime`'s silent no-op | `install_and_uninstall_round_trip` |
-| 10 | `present` is satisfied by a desktop entry that merely exists | `a_manager_is_detected_only_when_it_can_be_prove_present` |
+| 10 | `present` is satisfied by a desktop entry that merely exists | `a_manager_is_detected_only_when_it_can_be_proven_present` |
 | 11 | detection accepts an `Exec` line with no `%1` | `install_refuses_a_manager_it_could_not_use` |
 | 12 | detection fires on a configuration the user built | `install_refuses_a_manager_it_could_not_use` |
-| 13 | detection registers a manager whose executable does not resolve | `install_registers_a_manager_it_can_prove_is_present` |
+| 13 | detection registers a manager whose executable does not resolve | `install_refuses_a_manager_it_could_not_use` |
 
 One control is deliberately reported as **green**, and that is the point of
 running them at all. Breaking `Claim::exit_code` to always return 0 did **not**
 turn `install` green, because the "no manager, so nothing is routed" guard sets
-exit 3 independently. That is defence in depth working, and it is also a
-reminder that a control only proves what the test it targets actually asserts -
-control 6 above exists for the exit code itself.
+exit 3 independently. Removing that routing guard instead *does* turn `install`
+green at 0, so the two are genuinely independent and either one holds the line
+alone. The same mutation is not harmless overall: it still fails five unit tests
+and the two `uninstall` tests, which assert `needs_user` with no routing guard to
+back them up. That is defence in depth working, and it is also a reminder that a
+control only proves what the test it targets actually asserts - control 6 above
+exists for the exit code itself.
 
 The rest found real bugs while they were being written:
 
-* Control 7 reproduced a live defect: `xdg-mime default` exits **0 and writes
+* Control 9 reproduced a live defect: `xdg-mime default` exits **0 and writes
   nothing** when `$XDG_CONFIG_HOME` is missing, which is the state of a fresh
-  account. `install` claimed a scheme it had not claimed. Fixed by creating the
-  directory first, and the read-back now catches it if that regresses.
+  account - its only complaint goes to stderr. `install` claimed a scheme it had
+  not claimed. Fixed by creating the directory first, and the read-back now
+  catches it if that regresses.
 * Control 2 came back **green** the first time, which proved the test was not
   running where the logic lives: with `xdg-mime` installed, `install` delegates
   the edit entirely and nxmproxy's own editor never executes. That left the
@@ -602,6 +610,19 @@ The rest found real bugs while they were being written:
   "present" means: the JSON was satisfied by a desktop entry merely existing,
   while `install` also required the executable to resolve. Both now share one
   helper and one bar.
+
+### Known coverage gap
+
+`unclaim` does its own per-id filtering to decide which other managers survive on
+the `[Default Applications]` line, and **that filter has no test**. Breaking it
+so it keeps nothing leaves all 87 tests green, because the `uninstall` fixtures
+never put a second manager on the same `[Default Applications]` nxm key - the
+shared-key case is only exercised one level down, against `set_default_ids`
+directly, which is not the code path `unclaim` uses. Reaching it needs a
+`[Default Applications]` line reading `nxm=vortex.desktop;nxmproxy.desktop;`, which
+`xdg-mime` never writes (it replaces rather than appends) but a hand-edited file
+can contain. The code is correct by inspection; it is simply not defended by a
+control.
 
 ---
 
