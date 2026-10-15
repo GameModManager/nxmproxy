@@ -266,15 +266,28 @@ pub fn current_handler() -> Result<Option<String>, String> {
         .map(|(_, v)| v.trim().to_string()))
 }
 
+/// The key whose presence means "nxmproxy is registered".
+///
+/// Pure, so a test on any platform can assert *what we look up* without a
+/// Windows machine. This is the key that must be asked about.
+pub fn registration_key() -> String {
+    format!(r"{CLASSES}\{PROG_ID}\shell\open\command")
+}
+
+/// True when nxmproxy's ProgID is published, i.e. nxmproxy is one of the
+/// applications Windows may offer for `nxm://`.
+///
+/// This deliberately does **not** mean "nxmproxy is the default handler". We
+/// never write the bare `nxm` key, so by design we never take the scheme by
+/// force, and querying the default handler here would report "not installed"
+/// forever, even straight after a successful `install`. Registered means
+/// eligible; `current_handler` is what reports who actually handles it.
 pub fn is_registered() -> Result<bool, String> {
-    let Some(command) = current_handler()? else {
-        return Ok(false);
-    };
-    let this_exe = std::env::current_exe().ok();
-    Ok(match this_exe {
-        Some(exe) => command.contains(&exe.to_string_lossy().to_string()),
-        None => command.to_ascii_lowercase().contains("nxmproxy"),
-    })
+    let output = Command::new("reg")
+        .args(["query", &registration_key(), "/ve"])
+        .output()
+        .map_err(|e| format!("could not run reg.exe ({e}); is this Windows?"))?;
+    Ok(output.status.success())
 }
 
 #[cfg(test)]
@@ -410,6 +423,22 @@ mod tests {
             removed.len(),
             2,
             "uninstall must not go deleting unrelated keys"
+        );
+    }
+
+    #[test]
+    fn registration_is_asked_about_our_progid_not_the_bare_scheme() {
+        // The bug this asserts against: asking reg.exe about HKCR\nxm, the
+        // default handler, to decide whether we are *registered*. We never
+        // write that key on purpose, so `test` reported "not installed"
+        // forever, and the install/uninstall round trip failed on Windows.
+        let key = registration_key();
+        assert!(key.contains(PROG_ID), "{key}");
+        assert!(key.starts_with(r"HKCU\"), "{key}");
+        assert_ne!(key, r"HKCR\nxm\shell\open\command");
+        assert!(
+            !key.ends_with(r"\nxm"),
+            "must not be the bare scheme: {key}"
         );
     }
 
