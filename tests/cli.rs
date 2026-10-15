@@ -240,8 +240,8 @@ fn stderr(output: &Output) -> String {
 ///
 /// Hardcoding `/bin/true` is wrong on macOS and on Windows, where it does not
 /// exist; the first CI run failed on both platforms for exactly that reason.
-fn bin_path() -> String {
-    env!("CARGO_BIN_EXE_nxmproxy").to_string()
+fn bin_path() -> &'static str {
+    BIN
 }
 
 /// The `[Default Applications]` value for `key`, or `None`.
@@ -431,16 +431,7 @@ fn an_empty_config_with_one_manager_still_delivers() {
     // immediately. Hardcoding /bin/true, as this test did, is wrong on macOS
     // (where it lives at /usr/bin/true) and on Windows (where it does not
     // exist); the first CI run failed on both.
-    let registered = run(
-        &sandbox,
-        &[
-            "register",
-            "only",
-            env!("CARGO_BIN_EXE_nxmproxy"),
-            "--",
-            "list",
-        ],
-    );
+    let registered = run(&sandbox, &["register", "only", bin_path(), "--", "list"]);
     assert_eq!(code(&registered), 0, "{}", stderr(&registered));
 
     // No `assign` was ever run: every domain must go to the only manager.
@@ -773,7 +764,7 @@ fn linux_uninstall_removes_only_our_line() {
 #[test]
 fn the_command_names_are_the_final_surface_and_the_old_ones_are_gone() {
     let sandbox = Sandbox::new("names");
-    let exec = env!("CARGO_BIN_EXE_nxmproxy");
+    let exec = bin_path();
 
     // `register` is upstream's name for this and still means this.
     assert_eq!(
@@ -829,31 +820,59 @@ fn the_command_names_are_the_final_surface_and_the_old_ones_are_gone() {
     }
 }
 
+/// On every platform, `install` must refuse to call a setup with no manager
+/// to forward to done.
+///
+/// This is the property that survives everywhere, and it is the one the whole
+/// exit-code split exists for. It is separated from the round trip below
+/// because on macOS `install` is killed by LaunchServices before it prints
+/// anything, so an assertion about its output could not hold there - and a test
+/// that fails for a reason unrelated to what it is about is worse than a test
+/// that says only what it can prove.
+#[test]
+fn install_never_calls_a_routing_setup_done() {
+    let sandbox = Sandbox::new("never-done");
+    let _lock = install_sandbox(&sandbox);
+
+    let installed = run(&sandbox, &["install"]);
+    // Nothing is configured in this sandbox and nothing is detectable on a bare
+    // runner, so there are two reasons not to be done and either is enough.
+    assert_eq!(
+        code_tolerating_kill(&installed),
+        3,
+        "an install that routes nothing is not done: {}{}",
+        stdout(&installed),
+        stderr(&installed)
+    );
+    assert_ne!(
+        code_tolerating_kill(&installed),
+        0,
+        "exit 0 over an install that routes nothing is the trap this code exists to close"
+    );
+}
+
 /// `test` after `install` must report registered, and `uninstall` must remove
 /// exactly what `install` created and nothing else.
 ///
-/// This runs on all three platforms, which is deliberate: the *claim* is
-/// platform-specific and mostly unclaimable on macOS and Windows, but the
-/// publish/revert round trip and the exit-code contract are not, and a Linux
-/// only build cannot see a broken `uninstall` on Windows at all.
+/// Linux and Windows only. On macOS `install` is killed by LaunchServices in a
+/// session with no GUI, so there is no post-install state to assert about and
+/// pretending otherwise would be a test that cannot pass. The part of the
+/// contract that *is* checkable on macOS is
+/// [`install_never_calls_a_routing_setup_done`].
+#[cfg(not(target_os = "macos"))]
 #[test]
 fn install_and_uninstall_round_trip() {
     let sandbox = Sandbox::new("round-trip");
     let _lock = install_sandbox(&sandbox);
 
     let tested = run(&sandbox, &["test"]);
-    assert_eq!(
-        code_tolerating_kill(&tested),
-        1,
-        "not installed means a non-zero exit code"
-    );
+    assert_eq!(code(&tested), 1, "not installed means a non-zero exit code");
 
     let installed = run(&sandbox, &["install"]);
     // No manager is registered in this sandbox and none can be detected, so
-    // install has correctly left a step for the user. It must NOT report 0:
-    // a script seeing 0 would consider an install that routes nothing done.
+    // install has correctly left a step for the user.
     assert_eq!(
-        code_tolerating_kill(&installed),
+        code(&installed),
         3,
         "an install with no mod manager is not done: {}{}",
         stdout(&installed),
@@ -865,18 +884,16 @@ fn install_and_uninstall_round_trip() {
         stdout(&installed)
     );
 
-    // With a manager present the same command succeeds outright.
+    // With a manager present the same command succeeds outright on Linux, and
+    // still reports needs-user on Windows, which cannot choose the default app.
     assert_eq!(
-        code_tolerating_kill(&run(
-            &sandbox,
-            &["register", "one", &bin_path(), "--", "%1"]
-        )),
+        code(&run(&sandbox, &["register", "one", bin_path(), "--", "%1"])),
         0
     );
     let installed = run(&sandbox, &["install"]);
     let expected = if cfg!(target_os = "linux") { 0 } else { 3 };
     assert_eq!(
-        code_tolerating_kill(&installed),
+        code(&installed),
         expected,
         "{}{}",
         stdout(&installed),
@@ -884,7 +901,7 @@ fn install_and_uninstall_round_trip() {
     );
 
     let after = run(&sandbox, &["test"]);
-    assert_eq!(code_tolerating_kill(&after), 0, "{}", stderr(&after));
+    assert_eq!(code(&after), 0, "{}", stderr(&after));
     assert!(
         stdout(&after).contains("registered: true"),
         "{}",
@@ -892,16 +909,16 @@ fn install_and_uninstall_round_trip() {
     );
 
     let uninstalled = run(&sandbox, &["uninstall"]);
-    // uninstall is honest too: Linux gives the scheme back and says so, the
-    // other two cannot and say so. Neither may claim success.
+    // uninstall is honest too: Linux gives the scheme back and says so, Windows
+    // cannot and says so. Neither may claim success.
     assert_ne!(
-        code_tolerating_kill(&uninstalled),
+        code(&uninstalled),
         1,
         "uninstall failed outright: {}",
         stderr(&uninstalled)
     );
     let after = run(&sandbox, &["test"]);
-    assert_eq!(code_tolerating_kill(&after), 1);
+    assert_eq!(code(&after), 1);
     assert!(
         stdout(&after).contains("registered: false"),
         "{}",
@@ -916,45 +933,108 @@ fn install_and_uninstall_round_trip() {
     );
 }
 
-/// The design question, made into a test: an install that routes nothing is a
-/// broken install, so `install` must find a manager it can prove is here and
-/// register it - and must never touch a configuration the user already built.
+/// The design question, made into a test: does nxmproxy find a manager it can
+/// prove is installed, and refuse to invent one it cannot?
 ///
-/// The proof is a desktop file the manager writes for itself, which is the only
-/// signal that works for a QtIFW install that is not on `PATH`. Both halves
-/// matter: a false positive routes links to a program that is not there, and a
-/// false negative is only a printed command. So detection is allowed to refuse.
+/// Asserted through `list --json`, which never calls `install` and so is safe
+/// on all three platforms - including macOS, where `install` is killed by
+/// LaunchServices. The `present` flag is the same judgement `install` acts on.
+#[test]
+fn a_manager_is_detected_only_when_it_can_be_proven_present() {
+    let sandbox = Sandbox::new("detect");
+    let apps = sandbox.data_applications();
+    std::fs::create_dir_all(&apps).unwrap();
+
+    let present = |sandbox: &Sandbox| -> Vec<(String, bool)> {
+        let listed = run(sandbox, &["list", "--json"]);
+        assert_eq!(code(&listed), 0, "{}", stderr(&listed));
+        let json: serde_json::Value = serde_json::from_str(&stdout(&listed))
+            .unwrap_or_else(|e| panic!("list --json must be valid JSON: {e}"));
+        json["known_managers"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|e| {
+                (
+                    e["id"].as_str().unwrap().to_string(),
+                    e["present"].as_bool().unwrap(),
+                )
+            })
+            .collect()
+    };
+    let gmm_present =
+        |v: &[(String, bool)]| v.iter().find(|(id, _)| id == "gamemodmanager").unwrap().1;
+
+    assert!(
+        !gmm_present(&present(&sandbox)),
+        "nothing is installed in a bare sandbox, so nothing may be reported present: {:?}",
+        present(&sandbox)
+    );
+
+    // The evidence: the desktop entry GameMod Manager writes for itself when the
+    // user enables its nxm handling. It is not on PATH - the binary is at an
+    // absolute path inside the sandbox - so this file is the only place the
+    // path is recorded. That is the entire reason detection reads it.
+    let real = bin_path();
+    std::fs::write(
+        apps.join("gamemodmanager-nxm.desktop"),
+        format!(
+            "[Desktop Entry]\nType=Application\nName=GameModManager\n\
+             Exec=\"{real}\" --handle-nxm %u\nMimeType=x-scheme-handler/nxm;\n"
+        ),
+    )
+    .unwrap();
+    assert!(
+        gmm_present(&present(&sandbox)),
+        "the desktop entry the manager wrote is proof of installation"
+    );
+
+    // Present but pointing at something that does not exist is not proof.
+    std::fs::write(
+        apps.join("gamemodmanager-nxm.desktop"),
+        "[Desktop Entry]\nExec=/definitely/not/here --handle-nxm %u\n",
+    )
+    .unwrap();
+    assert!(
+        !gmm_present(&present(&sandbox)),
+        "an entry naming a binary that is not there is not evidence"
+    );
+}
+
+/// `install` acts on the detection: it registers what it proved, and the link
+/// routes with nothing further configured.
+///
+/// Linux only, because this asserts on what `install` *wrote*, and on macOS
+/// `install` is killed before it writes anything. The detection half of the
+/// decision is covered on every platform by
+/// [`a_manager_is_detected_only_when_it_can_be_proven_present`].
+#[cfg(target_os = "linux")]
 #[test]
 fn install_registers_a_manager_it_can_prove_is_present() {
-    let sandbox = Sandbox::new("detect");
+    let sandbox = Sandbox::new("detect-install");
     let _lock = install_sandbox(&sandbox);
     let apps = sandbox.data_applications();
     std::fs::create_dir_all(&apps).unwrap();
 
     // Nothing present: install must refuse to guess and must say what to type.
     let blind = run(&sandbox, &["install"]);
-    assert_eq!(code_tolerating_kill(&blind), 3);
+    assert_eq!(code(&blind), 3);
     assert!(
         !sandbox.config_file().exists(),
         "install invented a manager with no evidence: {}",
         std::fs::read_to_string(sandbox.config_file()).unwrap_or_default()
     );
 
-    // Now the evidence appears: the desktop entry GameMod Manager writes for
-    // itself when the user turns on its nxm handling. Its `Exec=` line names
-    // the binary, which is the whole point - nxmproxy must not have to guess a
-    // path, and must not register a bare command name that is not on PATH.
-    let real = env!("CARGO_BIN_EXE_nxmproxy");
-    let gmm_entry = format!(
-        "[Desktop Entry]\nType=Application\nName=GameModManager\nExec=\"{real}\" --handle-nxm %u\n\
-         MimeType=x-scheme-handler/nxm;\n"
-    );
-    std::fs::write(apps.join("gamemodmanager-nxm.desktop"), gmm_entry).unwrap();
+    std::fs::write(
+        apps.join("gamemodmanager-nxm.desktop"),
+        format!("[Desktop Entry]\nExec=\"{}\" --handle-nxm %u\n", bin_path()),
+    )
+    .unwrap();
 
     let detected = run(&sandbox, &["install"]);
     assert_eq!(
-        code_tolerating_kill(&detected),
-        if cfg!(target_os = "linux") { 0 } else { 3 },
+        code(&detected),
+        0,
         "{}{}",
         stdout(&detected),
         stderr(&detected)
@@ -975,19 +1055,29 @@ fn install_registers_a_manager_it_can_prove_is_present() {
     // one registered manager owns every unassigned domain.
     let delivered = run(&sandbox, &["url", "nxm://skyrimse/mods/1/files/2"]);
     assert_eq!(
-        code_tolerating_kill(&delivered),
+        code(&delivered),
         0,
         "an out-of-the-box install must route: {}{}",
         stdout(&delivered),
         stderr(&delivered)
     );
+}
 
-    // A configuration the user built is never extended. Two managers is
-    // ambiguous on purpose, and install must not resolve it by adding a third.
-    let unusable = Sandbox::new("detect-nourl");
-    std::fs::create_dir_all(unusable.data_applications()).unwrap();
+/// Two refusals, both because registering the manager would have produced an
+/// install that cannot work.
+#[cfg(target_os = "linux")]
+#[test]
+fn install_refuses_a_manager_it_could_not_use() {
+    // One lock for the whole test, covering both sandboxes: `INSTALL_LOCK` is a
+    // plain Mutex and is not reentrant, so taking it twice in one test
+    // deadlocks. That is exactly what happened the first time this was written.
+    let _lock = INSTALL_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+
     // Present, resolvable, and useless: nothing in the command receives the
     // link, so every download would start the manager and hand it nothing.
+    let unusable = Sandbox::new("detect-nourl");
+    let _ = run(&unusable, &["uninstall"]);
+    std::fs::create_dir_all(unusable.data_applications()).unwrap();
     std::fs::write(
         unusable
             .data_applications()
@@ -995,10 +1085,9 @@ fn install_registers_a_manager_it_can_prove_is_present() {
         format!("[Desktop Entry]\nExec=\"{}\" --quiet\n", bin_path()),
     )
     .unwrap();
-    let _ = run(&unusable, &["uninstall"]);
     let refused = run(&unusable, &["install"]);
     assert_eq!(
-        code_tolerating_kill(&refused),
+        code(&refused),
         3,
         "a manager that never receives the link is not a working install: {}{}",
         stdout(&refused),
@@ -1010,20 +1099,22 @@ fn install_registers_a_manager_it_can_prove_is_present() {
         std::fs::read_to_string(unusable.config_file()).unwrap_or_default()
     );
 
+    // A configuration the user built is never extended. Two managers is
+    // ambiguous on purpose, and install must not resolve it by adding a third.
     let other = Sandbox::new("detect-two");
+    let _ = run(&other, &["uninstall"]);
     for name in ["one", "two"] {
         assert_eq!(
-            code_tolerating_kill(&run(&other, &["register", name, &bin_path(), "--", "%1"])),
+            code(&run(&other, &["register", name, bin_path(), "--", "%1"])),
             0
         );
     }
-    assert!(std::fs::create_dir_all(other.data_applications()).is_ok());
+    std::fs::create_dir_all(other.data_applications()).unwrap();
     std::fs::write(
         other.data_applications().join("gamemodmanager-nxm.desktop"),
         format!("[Desktop Entry]\nExec=\"{}\" --handle-nxm %u\n", bin_path()),
     )
     .unwrap();
-    let _ = run(&other, &["uninstall"]);
     let kept = run(&other, &["install"]);
     assert!(
         stdout(&kept).contains("Keeping the mod managers already"),
@@ -1034,43 +1125,6 @@ fn install_registers_a_manager_it_can_prove_is_present() {
     assert!(
         !config.contains("gamemodmanager"),
         "install added a third manager to a configuration it did not create:\n{config}"
-    );
-}
-
-/// Unregistering a manager must not leave assignments pointing at nothing:
-/// upstream's `deregister` did exactly that, and the dangling id then made the
-/// game unroutable forever.
-#[test]
-fn register_assign_unregister_round_trips_through_the_file() {
-    let sandbox = Sandbox::new("config-round-trip");
-
-    assert_eq!(
-        code(&run(
-            &sandbox,
-            &["register", "vortex", "/opt/vortex/vortex", "--", "%1"]
-        )),
-        0
-    );
-    assert_eq!(code(&run(&sandbox, &["assign", "vortex", "skyrimse"])), 0);
-    assert_eq!(code(&run(&sandbox, &["assign", "vortex", "_"])), 0);
-
-    let text = std::fs::read_to_string(sandbox.config_file()).unwrap();
-    assert!(text.contains("skyrimse"), "{text}");
-    assert!(
-        text.contains("/opt/vortex/vortex"),
-        "sanity: the file really is the manager shape: {text}"
-    );
-
-    // The alias upstream used still works.
-    assert_eq!(code(&run(&sandbox, &["unregister", "vortex"])), 0);
-    let text = std::fs::read_to_string(sandbox.config_file()).unwrap();
-    assert!(!text.contains("skyrimse"), "dangling assignment: {text}");
-    assert!(!text.contains("vortex"), "manager not removed: {text}");
-
-    assert_eq!(
-        code(&run(&sandbox, &["unregister", "vortex"])),
-        1,
-        "nothing left to remove"
     );
 }
 

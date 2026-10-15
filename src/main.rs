@@ -332,15 +332,13 @@ pub fn detect_manager() -> Option<(&'static defaults::Known, Manager)> {
     let candidates: Vec<(&'static defaults::Known, Manager)> = defaults::KNOWN
         .iter()
         .filter_map(|known| {
-            let from_entry = known
-                .desktop
-                .and_then(|id| desktop_entry_paths(id).into_iter().find(|p| p.is_file()))
-                .and_then(|path| std::fs::read_to_string(path).ok())
-                .and_then(|text| exec_line_of(&text))
-                .and_then(|line| parse_exec_line(&line))
-                .filter(|(exe, args)| {
-                    resolve_exec(exe).is_some() && args.iter().any(|a| a == "%1")
-                });
+            let from_entry =
+                known
+                    .desktop
+                    .and_then(desktop_entry_invocation)
+                    .filter(|(exe, args)| {
+                        resolve_exec(exe).is_some() && args.iter().any(|a| a == "%1")
+                    });
 
             let manager = match from_entry {
                 Some((exe, args)) => Manager {
@@ -371,10 +369,31 @@ pub fn detect_manager() -> Option<(&'static defaults::Known, Manager)> {
     }
 }
 
-/// True when `known` is installed here, for `list --json`'s `present` flag.
+/// The manager's own desktop entry, found and parsed into an executable and argv.
+///
+/// One definition of "what its entry says", shared by [`detect_manager`] and
+/// [`is_present`]. They were separate for a moment and disagreed: `present` was
+/// satisfied by the entry merely existing, while `install` also required the
+/// executable to resolve and to receive the link. `list --json` therefore told a
+/// user a manager was present that `install` then refused to register, which is
+/// the kind of disagreement that makes a diagnostic useless.
+fn desktop_entry_invocation(id: &str) -> Option<(String, Vec<String>)> {
+    desktop_entry_paths(id)
+        .into_iter()
+        .find(|p| p.is_file())
+        .and_then(|path| std::fs::read_to_string(path).ok())
+        .and_then(|text| exec_line_of(&text))
+        .and_then(|line| parse_exec_line(&line))
+}
+
+/// True when `known` is installed here **and usable**, for `list --json`'s
+/// `present` flag.
+///
+/// Same bar as [`detect_manager`], on purpose: an entry naming a binary that is
+/// not there is not a manager the user has.
 pub fn is_present(known: &defaults::Known) -> bool {
-    if let Some(id) = known.desktop {
-        if desktop_entry_paths(id).iter().any(|p| p.is_file()) {
+    if let Some((exe, args)) = known.desktop.and_then(desktop_entry_invocation) {
+        if resolve_exec(&exe).is_some() && args.iter().any(|a| a == "%1") {
             return true;
         }
     }
