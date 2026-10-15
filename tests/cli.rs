@@ -2162,16 +2162,23 @@ fn list_shows_each_game_under_the_manager_that_owns_it() {
 #[test]
 fn list_is_exactly_the_documented_shape() {
     let sandbox = Sandbox::new("list-shape");
-    let (recorder, _) = argv_recorder(&sandbox, "apps/One");
+    // This test needs an exec that *resolves*, not one that records argv: an
+    // unresolved one prints `(unavailable)` and changes the bytes it pins. The
+    // running test binary is a real file on every platform, where
+    // `argv_recorder` (a /bin/sh script) is unix-only.
+    let exe = std::env::current_exe()
+        .unwrap()
+        .to_string_lossy()
+        .into_owned();
 
     assert_eq!(
-        code(&run(&sandbox, &["register", "one", &recorder, "--", "%1"])),
+        code(&run(&sandbox, &["register", "one", &exe, "--", "%1"])),
         0
     );
     assert_eq!(code(&run(&sandbox, &["assign", "one", "skyrimse"])), 0);
 
     let expected = format!(
-        "config: {}\n\nmod managers:\n  one: {recorder} %1\n    * skyrimse\n",
+        "config: {}\n\nmod managers:\n  one: {exe} %1\n    * skyrimse\n",
         sandbox.config_file().display()
     );
     assert_eq!(stdout(&run(&sandbox, &["list"])), expected);
