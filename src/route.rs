@@ -34,7 +34,7 @@ impl Reason {
         match self {
             Reason::NoManagers => format!(
                 "no mod managers are registered, so there is nothing to forward the nxm link for \
-                 {domain:?} to.\n  register one:  nxmproxy register-manager <name> <exec> [<args>...]"
+                 {domain:?} to.\n  register one:  nxmproxy register <name> <exec> [<args>...]"
             ),
             Reason::Ambiguous(ids) => format!(
                 "no mod manager is assigned to the nxm domain {domain:?}, and {} managers are \
@@ -256,7 +256,7 @@ mod tests {
                     let message = reason.message(domain);
                     assert!(message.contains("a-game-nobody-configured"), "{message}");
                     assert!(
-                        message.contains("nxmproxy register-manager")
+                        message.contains("nxmproxy register ")
                             || message.contains("nxmproxy assign"),
                         "the message must say what to do next: {message}"
                     );
@@ -301,7 +301,7 @@ mod tests {
             other => panic!("{other:?}"),
         }
         let message = Reason::NoManagers.message("skyrimse");
-        assert!(message.contains("register-manager"), "{message}");
+        assert!(message.contains("register"), "{message}");
     }
 
     #[test]

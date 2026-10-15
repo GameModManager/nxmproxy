@@ -46,10 +46,13 @@ jobs:
         run: cargo build --release
 
       # What this proves on macOS and Windows: the crate compiles there, and the
-      # pure logic and the platform module text are correct.
-      # What it does NOT prove: that lsregister makes macOS offer the bundle, or
-      # that reg.exe writes the keys we intend. Those need a real machine and a
-      # real click, and are called out as unverified in README.md.
+      # pure logic, the platform module text, and the "macOS and Windows never
+      # report a verified claim" rule are correct - that rule is a decision, not
+      # FFI, so it is enforced from every platform's build.
+      # What it does NOT prove: that LSSetDefaultHandlerForURLScheme makes macOS
+      # offer the bundle, or that reg.exe writes the keys we intend. Those need a
+      # real machine and a real click, and are called out as unverified in
+      # README.md.
       - name: Test
         run: cargo test --all-targets
 
@@ -57,8 +60,8 @@ jobs:
         run: cargo test --release --all-targets
 
       # The CLI contract a GUI depends on. Runs on all three platforms, and on
-      # Linux it is the test that proves registration never writes a default
-      # association.
+      # Linux it is the test that proves the claim goes into exactly one file
+      # and that no other mod manager's entry moved.
       - name: CLI smoke test
         shell: bash
         run: |

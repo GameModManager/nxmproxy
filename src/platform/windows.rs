@@ -42,6 +42,7 @@ use std::path::Path;
 use std::process::Command;
 
 use crate::logger;
+use crate::platform::Claim;
 
 /// Application-specific ProgID. Ours, so we never collide with another
 /// manager's registration.
@@ -241,6 +242,85 @@ pub fn uninstall() -> Result<(), String> {
         exec_reg(&op)?;
     }
     Ok(())
+}
+
+/// The settings page for this exact application, opened for the user to click.
+///
+/// `ms-settings:defaultapps` is Microsoft's documented URI for the Default Apps
+/// page, and the `registeredAppUser` parameter - added in Windows 11 21H2 - jumps
+/// straight to one app's page. **User, not Machine**, because the app is
+/// registered under `HKCU`; a machine-scoped lookup would not find it.
+///
+/// Built by a pure function so the exact string is testable on Linux, where no
+/// test can otherwise see it.
+pub fn default_apps_uri() -> String {
+    // `registeredAppUser` takes a URI-escaped name. The registered name has a
+    // space in it, so escaping is not optional here.
+    format!(
+        "ms-settings:defaultapps?registeredAppUser={}",
+        REGISTERED_APPLICATION_NAME.replace(' ', "%20")
+    )
+}
+
+/// Windows will not let any program assign itself a default app.
+///
+/// The effective default lives in
+/// `HKCU\Software\Microsoft\Windows\CurrentVersion\Explorer\FileExts\...` or
+/// `...\App Paths`, behind `UserChoice`, whose `Hash` is a keyed digest Windows
+/// recomputes on every write and validates on every read. Writing it by hand
+/// produces a hash Windows rejects, and `reg add` against the key fails
+/// outright. This is a deliberate platform policy - documented as "apps cannot
+/// change default apps without user interaction in system UI" - not an
+/// obstacle to route around, so nothing here attempts it.
+///
+/// What `install` can do is publish a correct ProgID and a correct
+/// `RegisteredApplications` entry (which [`install`] does, and which the tests
+/// assert on every platform) so the app *appears* in Default Apps, and then
+/// open that page. The user finishes in one click.
+///
+/// The result is therefore never [`Claim::verified`]. There is no read-back to
+/// prove it and no program on this machine is permitted to make it true.
+pub fn claim() -> Result<Claim, String> {
+    let uri = default_apps_uri();
+    logger::info(format!("opening {uri}"));
+
+    // `explorer.exe` resolves the `ms-settings:` protocol for us. The
+    // alternative the docs show, `ShellExecuteExW`, would mean an FFI block
+    // here, and the reason this file drives `reg.exe` rather than the Win32 API
+    // is precisely to keep FFI out of a file that compiles on three platforms.
+    let opened = Command::new("explorer").arg(&uri).spawn();
+
+    let note = match &opened {
+        Ok(_) => format!("Opened Windows Settings at {uri}."),
+        Err(e) => format!("Could not open Windows Settings ({e}). Open it yourself at {uri}."),
+    };
+
+    Ok(Claim::needs_user(format!(
+        "{note}\n  \
+         nxmproxy is registered as URL:NXM Protocol and is listed in Default Apps, but \
+         Windows does not let any program choose the default app for you.\n  \
+         1. Press Win, type \"Default Apps\" and press Enter.\n  \
+         2. Search for \"NXM Proxy\" and click it.\n  \
+         3. Under \"Set defaults\", click \"Set default\" for .nxm links.\n  \
+         Until you do, nxm:// links still open with whatever handles them now."
+    )))
+}
+
+/// Give the scheme back.
+///
+/// The ProgID and the `RegisteredApplications` value are removed by
+/// [`uninstall`], which is the part that can actually be undone. The *default*
+/// choice cannot: Windows keeps `UserChoice` pointing at a ProgID that no longer
+/// exists and falls back to its own prompt, and no program may change that
+/// without user interaction. So the scheme comes back to the chooser, and the
+/// user is told so rather than being told the reverse.
+pub fn unclaim() -> Result<Claim, String> {
+    Ok(Claim::needs_user(
+        "Windows will not let nxmproxy take the nxm:// default back, so nxm:// links fall back \
+         to whatever Windows offers now.\n  \
+         To point them at another manager: Settings > Apps > Default apps > search for it, \
+         then Set default.",
+    ))
 }
 
 /// Read the *effective* handler for the scheme.
@@ -476,5 +556,88 @@ mod tests {
                 "/f",
             ]
         );
+    }
+
+    #[test]
+    fn the_settings_uri_names_this_app_and_escapes_its_spaces() {
+        // `ms-settings:defaultapps` is Microsoft's documented URI for the page.
+        let uri = default_apps_uri();
+        assert!(
+            uri.starts_with("ms-settings:defaultapps"),
+            "wrong settings page: {uri}"
+        );
+        // The parameter is scoped to *User* because the app is registered under
+        // HKCU. `registeredAppMachine` would not find a per-user registration.
+        assert!(
+            uri.contains("registeredAppUser="),
+            "a per-user app must use the User parameter: {uri}"
+        );
+        assert!(
+            !uri.contains("registeredAppMachine="),
+            "we are not machine-scoped: {uri}"
+        );
+        // An unescaped space truncates the parameter at the first space and
+        // lands Windows on the default apps page with no app selected, which is
+        // exactly the one-click flow this is supposed to save.
+        assert!(!uri.contains(' '), "the URI must be escaped: {uri}");
+        assert!(uri.contains("%20"), "expected escaped spaces in: {uri}");
+        // And it names the app we actually registered under RegisteredApplications.
+        let escaped = REGISTERED_APPLICATION_NAME.replace(' ', "%20");
+        assert!(
+            uri.ends_with(&escaped),
+            "must point at our own registration: {uri} vs {escaped}"
+        );
+    }
+
+    #[test]
+    fn windows_never_reports_a_claim_it_could_not_make() {
+        // The load-bearing assertion for this whole platform.
+        //
+        // `HKCU\...\UserChoice` is hash-protected and no app may write it, so
+        // `claim` cannot finish the job. If it ever returned `verified()`, a
+        // script would read exit 0 over an install where nxm:// links still
+        // open with another manager - a broken install, automated. This runs on
+        // every platform because the decision is data, not FFI.
+        let claim = claim().expect("claim must not error");
+        assert_eq!(
+            claim.exit_code(),
+            crate::platform::EXIT_NEEDS_USER,
+            "Windows cannot choose the default app, so it must not report success"
+        );
+        assert!(
+            !claim.instruction.trim().is_empty(),
+            "the user must be told exactly what to click"
+        );
+        // And the instruction has to be actionable, not a shrug.
+        assert!(
+            claim.instruction.contains("Set default"),
+            "expected the concrete click path: {}",
+            claim.instruction
+        );
+    }
+
+    #[test]
+    fn nothing_writes_the_user_choice_hash() {
+        // The forbidden route, stated as a test. If anyone "fixes" Windows
+        // claiming by writing UserChoice, this is the test that says why not:
+        // the value is a keyed digest Windows validates, so a hand-written one
+        // is rejected and `reg add` fails. Scans production source, see
+        // `crate::platform::production_code`.
+        let code = crate::platform::production_code(include_str!("windows.rs"));
+        for forbidden in ["UserChoice", "FileExts", "App Paths"] {
+            assert!(
+                !code.contains(forbidden),
+                "production code touches {forbidden}, the hash-protected default-app key"
+            );
+        }
+    }
+
+    #[test]
+    fn uninstall_is_honest_that_windows_keeps_the_choice() {
+        // Symmetric with claim(): it must not claim to have undone something
+        // the OS will not let it undo.
+        let un = unclaim().expect("unclaim must not error");
+        assert_eq!(un.exit_code(), crate::platform::EXIT_NEEDS_USER);
+        assert!(!un.instruction.trim().is_empty());
     }
 }

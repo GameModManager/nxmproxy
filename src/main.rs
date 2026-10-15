@@ -35,8 +35,16 @@ const LIST_SCHEMA_VERSION: u32 = 1;
     version,
     about = "Forward Nexus Mods nxm:// links to the mod manager assigned for that game.",
     long_about = "Forward Nexus Mods nxm:// links to the mod manager assigned for that game.\n\n\
-                  Register with `nxmproxy install` and then assign games with\n\
-                  `nxmproxy assign <manager> <domain>`. Run `nxmproxy list` to see the routing table."
+                  Take nxm:// with `nxmproxy install`, add a mod manager with\n\
+                  `nxmproxy register <name> <exec> [-- <args>...]`, then assign games with\n\
+                  `nxmproxy assign <manager> <domain>`. `nxmproxy list` shows the routing table.\n\n\
+                  Exit codes:\n  \
+                    0  done, and verified\n  \
+                    1  the command failed\n  \
+                    2  bad command line\n  \
+                    3  registered, but the OS requires one step you must do by hand\n\
+                       (the message says which). Nothing failed; nxmproxy did all the\n\
+                       platform allows."
 )]
 struct Cli {
     #[command(subcommand)]
@@ -51,14 +59,26 @@ enum Command {
         url: String,
     },
 
-    /// Register nxmproxy as a handler for nxm:// links.
+    /// Install nxmproxy as the nxm:// handler, and claim the scheme.
     ///
-    /// This makes nxmproxy eligible. It does not make it the default: no
-    /// default association is written on any platform, so the OS still lets
-    /// you choose and other mod managers keep their claim.
+    /// This is both halves in one command: it publishes nxmproxy to the OS
+    /// (desktop entry, app bundle, or registry ProgID) **and** asks the OS to
+    /// make it the handler for `nxm://`. How hard that second half can push
+    /// depends on the platform, and `install` never reports more than it did:
+    ///
+    /// * Linux - writes one `[Default Applications]` line with `xdg-mime`, and
+    ///   `uninstall` takes that line back out.
+    /// * macOS - calls LaunchServices, which on macOS 12+ asks you first.
+    /// * Windows - **cannot** choose the default app; no program may. It opens
+    ///   the Default Apps page for you instead and exits 3.
+    ///
+    /// Exit 0 only when nxmproxy really is the handler and that was checked.
     Install,
 
-    /// Remove the nxm:// registration. Only what `install` created is removed.
+    /// Remove nxmproxy as the nxm:// handler, and undo what `install` published.
+    ///
+    /// Symmetric with `install`. Linux removes nxmproxy's own
+    /// `[Default Applications]` line and touches no other manager's entry.
     Uninstall,
 
     /// Report whether nxmproxy is registered, and who the OS says handles nxm://.
@@ -72,8 +92,12 @@ enum Command {
     },
 
     /// Register a mod manager so games can be assigned to it.
-    #[command(visible_alias = "register")]
-    RegisterManager {
+    ///
+    /// Upstream's `register` did this too, so the name is unchanged. Upstream
+    /// took a command *string*; this takes an executable and a separate
+    /// argument vector, which is why a path with spaces in it works here and
+    /// did not there.
+    Register {
         /// Name to refer to this manager by.
         name: String,
         /// The executable, a path or a bare command name found on PATH.
@@ -84,8 +108,10 @@ enum Command {
     },
 
     /// Remove a mod manager and every game assignment pointing at it.
-    #[command(visible_alias = "deregister")]
-    UnregisterManager {
+    ///
+    /// Upstream spelled this `deregister`. Renamed, because it removes rather
+    /// than deregisters and there is no registry left to speak of.
+    Unregister {
         /// Name of the manager.
         name: String,
     },
@@ -189,6 +215,11 @@ struct JsonKnownManager {
     exec: &'static str,
     args: &'static [&'static str],
     note: &'static str,
+    /// True when this manager is actually present on this machine. The GUI can
+    /// offer it as a one-click register instead of making the user find the
+    /// path, which is the only way this works for a QtIFW install that is not
+    /// on `PATH`.
+    present: bool,
 }
 
 #[derive(serde::Serialize)]
@@ -205,6 +236,170 @@ struct JsonList<'a> {
     warnings: &'a [String],
 }
 
+/// Where a manager's XDG desktop entry would be, if it writes one.
+fn desktop_entry_paths(id: &str) -> Vec<PathBuf> {
+    let file = format!("{id}.desktop");
+    let mut dirs: Vec<PathBuf> = Vec::new();
+    if let Some(data_home) = std::env::var_os("XDG_DATA_HOME").map(PathBuf::from) {
+        dirs.push(data_home);
+    }
+    if let Some(home) = std::env::var_os("HOME").map(PathBuf::from) {
+        dirs.push(home.join(".local").join("share"));
+    }
+    dirs.iter()
+        .map(|d| d.join("applications").join(&file))
+        .collect()
+}
+
+/// Split the `Exec=` line of a desktop entry into an executable and its argv.
+///
+/// `%1` is what nxmproxy substitutes, because it is substituted into a single
+/// argv element and is therefore never split. `%u` is the desktop entry spec's
+/// code for "the URI", and GameMod Manager writes `%u` in its own entry, so the
+/// two are mapped onto each other here.
+///
+/// Only the two quoting forms real desktop entries actually produce are handled:
+/// a bare path, and a `"`-quoted path. GameMod Manager quotes its `Exec` path
+/// when it contains whitespace (and `xdg-mime`'s own parser does not strip
+/// quotes either, which is why it quotes), so those two are the whole of it.
+/// Anything else returns `None` rather than a guess.
+///
+/// Pure, so the quoting is testable on every platform with no desktop anywhere.
+pub fn parse_exec_line(line: &str) -> Option<(String, Vec<String>)> {
+    let line = line.trim();
+    if line.is_empty() {
+        return None;
+    }
+
+    let (exe, rest) = if let Some(quoted) = line.strip_prefix('"') {
+        let end = quoted.find('"')?;
+        (quoted[..end].to_string(), quoted[end + 1..].trim())
+    } else {
+        match line.find(char::is_whitespace) {
+            Some(i) => (line[..i].to_string(), line[i..].trim()),
+            None => (line.to_string(), ""),
+        }
+    };
+    if exe.is_empty() {
+        return None;
+    }
+
+    let args = rest
+        .split_whitespace()
+        .map(|a| match a {
+            "%u" | "%U" | "%1" => "%1".to_string(),
+            // Field codes that carry no argument. They describe a window, not
+            // the argv, so passing them through would corrupt the command.
+            "%f" | "%F" | "%i" | "%c" | "%k" | "%d" | "%D" | "%n" | "%N" | "%v" | "%m" => {
+                String::new()
+            }
+            other => other.to_string(),
+        })
+        .filter(|a| !a.is_empty())
+        .collect();
+
+    Some((exe, args))
+}
+
+/// The `Exec=` line from desktop entry text, if it has one.
+fn exec_line_of(entry: &str) -> Option<String> {
+    entry
+        .lines()
+        .find_map(|line| line.trim().strip_prefix("Exec=").map(str::to_string))
+}
+
+/// A manager that is actually installed here, and how to invoke it.
+///
+/// Two sources, in order of trust:
+///
+/// 1. **The manager's own XDG desktop entry**, when it has one. That file is
+///    written by the manager itself and holds its real `Exec=` line, so reading
+///    it requires no guess at all. This is the only thing that works for GameMod
+///    Manager on Linux: QtIFW installs it to a prefix that is **not** on `PATH`,
+///    so `resolve_exec("gamemodmanager")` finds nothing on a machine where GMM is
+///    plainly installed, while the desktop entry exists and names the binary.
+/// 2. **`PATH`**, for everything else.
+///
+/// A candidate is accepted only when the resulting executable really resolves.
+/// Registering a manager that cannot be started would produce exactly the broken
+/// install this exists to prevent, so an unresolvable candidate is a refusal
+/// rather than a warning. Refusing is safe: the caller prints the command to type.
+///
+/// Only ever consulted when the configuration has **no** managers at all, and
+/// only ever returns a single one. A user who configured something has already
+/// answered this question.
+pub fn detect_manager() -> Option<(&'static defaults::Known, Manager)> {
+    let candidates: Vec<(&'static defaults::Known, Manager)> = defaults::KNOWN
+        .iter()
+        .filter_map(|known| {
+            let from_entry =
+                known
+                    .desktop
+                    .and_then(desktop_entry_invocation)
+                    .filter(|(exe, args)| {
+                        resolve_exec(exe).is_some() && args.iter().any(|a| a == "%1")
+                    });
+
+            let manager = match from_entry {
+                Some((exe, args)) => Manager {
+                    exec: exe,
+                    args,
+                    pipe: None,
+                },
+                // No usable entry: fall back to PATH, which is all a manager
+                // without a desktop file can offer.
+                None if resolve_exec(known.exec).is_some() => Manager {
+                    exec: known.exec.to_string(),
+                    args: known.args.iter().map(|a| a.to_string()).collect(),
+                    pipe: None,
+                },
+                None => return None,
+            };
+            Some((known, manager))
+        })
+        .collect();
+
+    // Exactly one, or none. Two managers installed is genuinely ambiguous and
+    // guessing routes downloads to the wrong mod queue, which is the failure
+    // `Route::Ambiguous` exists to refuse at click time. `install` must not
+    // invent the very ambiguity it refuses to resolve later.
+    match candidates.as_slice() {
+        [(only, manager)] => Some((*only, manager.clone())),
+        _ => None,
+    }
+}
+
+/// The manager's own desktop entry, found and parsed into an executable and argv.
+///
+/// One definition of "what its entry says", shared by [`detect_manager`] and
+/// [`is_present`]. They were separate for a moment and disagreed: `present` was
+/// satisfied by the entry merely existing, while `install` also required the
+/// executable to resolve and to receive the link. `list --json` therefore told a
+/// user a manager was present that `install` then refused to register, which is
+/// the kind of disagreement that makes a diagnostic useless.
+fn desktop_entry_invocation(id: &str) -> Option<(String, Vec<String>)> {
+    desktop_entry_paths(id)
+        .into_iter()
+        .find(|p| p.is_file())
+        .and_then(|path| std::fs::read_to_string(path).ok())
+        .and_then(|text| exec_line_of(&text))
+        .and_then(|line| parse_exec_line(&line))
+}
+
+/// True when `known` is installed here **and usable**, for `list --json`'s
+/// `present` flag.
+///
+/// Same bar as [`detect_manager`], on purpose: an entry naming a binary that is
+/// not there is not a manager the user has.
+pub fn is_present(known: &defaults::Known) -> bool {
+    if let Some((exe, args)) = known.desktop.and_then(desktop_entry_invocation) {
+        if resolve_exec(&exe).is_some() && args.iter().any(|a| a == "%1") {
+            return true;
+        }
+    }
+    resolve_exec(known.exec).is_some()
+}
+
 /// The curated list, pre-rendered. `OnceLock` because it is built once and
 /// serialised on every `list --json`.
 fn known_managers_json() -> &'static [JsonKnownManager] {
@@ -219,6 +414,7 @@ fn known_managers_json() -> &'static [JsonKnownManager] {
                 exec: k.exec,
                 args: k.args,
                 note: k.note,
+                present: is_present(k),
             })
             .collect()
     })
@@ -261,7 +457,7 @@ fn print_list(config: &Config, loaded: &config::Loaded, dir: &Path) {
 
     if config.managers.is_empty() {
         println!("\nno mod managers registered.");
-        println!("  nxmproxy register-manager vortex /path/to/vortex.exe -- %1");
+        println!("  nxmproxy register vortex /path/to/vortex.exe -- %1");
         println!("  see `nxmproxy list --json` for a curated list of known managers");
         return;
     }
@@ -369,6 +565,111 @@ fn handle_test() -> i32 {
     i32::from(!status.registered)
 }
 
+/// Compose `install`: publish nxmproxy, claim `nxm://`, and make sure a link
+/// has somewhere to go.
+///
+/// Three independent outcomes, and the exit code is the *worst* of them.
+/// Anything less would report a working install over a setup that routes
+/// nothing, which is the failure this whole command exists to avoid.
+fn handle_install(config: &mut Config, save: &dyn Fn(&Config) -> i32) -> i32 {
+    // 1. Publish ourselves to the OS. This is what `install` has always done,
+    //    and the only step Windows can do by itself.
+    if let Err(message) = platform::imp::install() {
+        eprintln!("nxmproxy: {message}");
+        return platform::EXIT_FAILED;
+    }
+
+    // 2. Take the scheme. Cannot be done on every platform, and never reported
+    //    as done unless it was checked here.
+    let claim = match platform::imp::claim() {
+        Ok(claim) => claim,
+        Err(message) => {
+            eprintln!("nxmproxy: {message}");
+            return platform::EXIT_FAILED;
+        }
+    };
+
+    // 3. A handler that delivers every link to a crash is not installed.
+    let mut code = claim.exit_code();
+    let already_configured = !config.managers.is_empty();
+    let mut routing_ready = already_configured;
+    if already_configured {
+        println!("Keeping the mod managers already in your configuration.");
+    } else {
+        match detect_manager() {
+            Some((known, manager)) => match config.register_manager(known.id, manager) {
+                Ok(()) => {
+                    routing_ready = true;
+                    let saved = save(config);
+                    if saved != platform::EXIT_OK {
+                        code = saved;
+                    }
+                    println!(
+                        "Found {} on this machine and registered it as {}. Every game routes to \
+                         it until you `assign` something else.",
+                        known.name, known.id
+                    );
+                }
+                Err(message) => {
+                    // Not fatal, and not a claim failure either: the scheme is
+                    // claimed and the user can type the command by hand.
+                    eprintln!("nxmproxy: could not pre-register {}: {message}", known.name);
+                }
+            },
+            None => {
+                println!(
+                    "\nnxmproxy handles nxm://, but there is no mod manager to forward to, so a\n\
+                     link would arrive and go nowhere. Add one now:\n\n    \
+                     nxmproxy register gamemodmanager gamemodmanager -- --handle-nxm %1\n\n\
+                     `nxmproxy list --json` lists the managers it can find on this machine."
+                );
+            }
+        }
+    }
+
+    // Claiming the scheme and having somewhere to forward it are two different
+    // things, and a script that only checks the exit code needs to know about
+    // both. Exit 3 already means "registered, one step left for you", and
+    // running `register` is exactly such a step.
+    if !routing_ready && code == platform::EXIT_OK {
+        code = platform::EXIT_NEEDS_USER;
+    }
+
+    if claim.claimed {
+        println!("nxm:// links now open in nxmproxy.");
+    } else {
+        println!("nxmproxy is registered as an nxm:// handler.");
+        println!("One step is left for you to do:");
+        println!("{}", claim.instruction);
+    }
+    code
+}
+
+/// Compose `uninstall`: give the scheme back, then remove what we published.
+///
+/// Reverses [`handle_install`] in the same order, and is equally honest about
+/// the half the OS will not give back: Linux removes its line, and macOS and
+/// Windows both report that the final assignment is the user's click.
+fn handle_uninstall() -> i32 {
+    let claim = match platform::imp::unclaim() {
+        Ok(claim) => claim,
+        Err(message) => {
+            eprintln!("nxmproxy: {message}");
+            return platform::EXIT_FAILED;
+        }
+    };
+    if let Err(message) = platform::imp::uninstall() {
+        eprintln!("nxmproxy: {message}");
+        return platform::EXIT_FAILED;
+    }
+
+    println!("nxmproxy's nxm:// handler has been removed.");
+    if !claim.claimed {
+        println!("{}", claim.instruction);
+    }
+    claim.exit_code()
+}
+
 fn run() -> i32 {
     let cli = Cli::parse();
 
@@ -416,31 +717,9 @@ fn run() -> i32 {
     match cli.command {
         Command::Url { url } => handle_url(&config, &url),
 
-        Command::Install => {
-            match platform::imp::install() {
-                Ok(()) => {
-                    println!("nxmproxy is now able to handle nxm:// links.");
-                    println!("It registers, it does not seize: no default association was written, so the");
-                    println!("OS will let you choose and other mod managers keep their claim.");
-                    0
-                }
-                Err(message) => {
-                    eprintln!("nxmproxy: {message}");
-                    1
-                }
-            }
-        }
+        Command::Install => handle_install(&mut config, &save),
 
-        Command::Uninstall => match platform::imp::uninstall() {
-            Ok(()) => {
-                println!("nxmproxy's nxm:// registration was removed.");
-                0
-            }
-            Err(message) => {
-                eprintln!("nxmproxy: {message}");
-                1
-            }
-        },
+        Command::Uninstall => handle_uninstall(),
 
         Command::Test => handle_test(),
 
@@ -455,7 +734,7 @@ fn run() -> i32 {
             0
         }
 
-        Command::RegisterManager { name, exec, args } => {
+        Command::Register { name, exec, args } => {
             let manager = Manager {
                 exec,
                 args: args.clone(),
@@ -487,7 +766,7 @@ fn run() -> i32 {
             code
         }
 
-        Command::UnregisterManager { name } => match config.unregister_manager(&name) {
+        Command::Unregister { name } => match config.unregister_manager(&name) {
             Ok(true) => {
                 println!("removed mod manager {name:?} and its game assignments.");
                 save(&config)
@@ -568,6 +847,63 @@ mod tests {
             "{present} should resolve on this platform"
         );
         assert!(resolve_exec("nxmproxy-definitely-not-a-real-binary").is_none());
+    }
+
+    #[test]
+    fn an_exec_line_becomes_a_path_and_an_argv() {
+        // This is what makes auto-detection work for a manager that is not on
+        // PATH: the desktop entry the manager wrote is the only place its real
+        // path exists, so getting this parse wrong means either a broken
+        // registration or no registration.
+        assert_eq!(
+            parse_exec_line("/opt/gmm/gamemodmanager --handle-nxm %u"),
+            Some((
+                "/opt/gmm/gamemodmanager".to_string(),
+                vec!["--handle-nxm".to_string(), "%1".to_string()]
+            ))
+        );
+        // A quoted path, which is what GMM writes when the path has a space in
+        // it. Splitting naively on whitespace truncates it to `/opt/My`, and
+        // the registered manager is then a file that does not exist.
+        assert_eq!(
+            parse_exec_line(r#""/opt/My Mods/gamemodmanager" --handle-nxm %u"#),
+            Some((
+                "/opt/My Mods/gamemodmanager".to_string(),
+                vec!["--handle-nxm".to_string(), "%1".to_string()]
+            ))
+        );
+        // An executable with no arguments at all is still a manager, just a
+        // useless one; detection rejects it later for having no `%1`.
+        assert_eq!(
+            parse_exec_line("/usr/bin/vortex"),
+            Some(("/usr/bin/vortex".to_string(), Vec::new()))
+        );
+    }
+
+    #[test]
+    fn the_desktop_field_codes_that_carry_no_argument_are_dropped() {
+        // `%f` is a file, `%i` the icon id, `%c` the translated name. Passing
+        // them through would put `%i` on the manager's command line, where it
+        // is a real argument to a real program and not a field code.
+        let (exe, args) =
+            parse_exec_line("/usr/bin/mo2 %U %f %i %c %k").expect("a parsable Exec line");
+        assert_eq!(exe, "/usr/bin/mo2");
+        assert_eq!(
+            args,
+            vec!["%1".to_string()],
+            "%U maps to %1 and nothing else"
+        );
+    }
+
+    #[test]
+    fn an_unparsable_exec_line_is_refused_rather_than_guessed() {
+        // A half-written entry must produce no manager, not a manager pointing
+        // at nothing. Detection treats `None` as "not installed", which makes
+        // `install` print the command to type - the safe direction.
+        assert_eq!(parse_exec_line(""), None);
+        assert_eq!(parse_exec_line("   "), None);
+        assert_eq!(parse_exec_line(r#""""#), None, "an empty quoted path");
+        assert_eq!(parse_exec_line(r#""unterminated"#), None);
     }
 
     #[test]

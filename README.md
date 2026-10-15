@@ -55,26 +55,60 @@ Every item here is a deliberate change, with the reason.
 ### Added
 
 * **`list --json`**: a machine-readable contract for a GUI or another manager.
-* **`register-manager` / `unregister-manager`**: a custom manager as
-  `{exec, argv vector}`. Upstream's `register` took a command *string*, and its
-  own README example (`README.md:11`, `c:\program files\...\vortex.exe`) was
-  **unquoted with spaces in it**, so it could not have worked.
-* **A curated list of known managers**, reported by `list --json`. Data only,
-  never auto-registered.
+* **`register` / `unregister`**: a custom manager as `{exec, argv vector}`.
+  Upstream's `register` took a command *string*, and its own README example
+  (`README.md:11`, `c:\program files\...\vortex.exe`) was **unquoted with spaces
+  in it**, so it could not have worked. The names are upstream's; only the
+  argument handling is new.
+* **A curated list of known managers**, reported by `list --json`, each with a
+  `present` flag saying whether it is actually on this machine.
 * **Empty configuration works out of the box**: with exactly one manager
   registered, every domain routes to it with nothing assigned.
 * **`uninstall`**, which upstream did not have.
+* **`install` claims the scheme**, not just registers. See below.
+* **Auto-registration on a fresh install**, when a manager can be proven present.
+  See "Finding the mod manager".
 * **Tests and CI.** Upstream had no tests at all.
 
-### The rule all three platforms obey: register, never seize
+### Changed: `install` now claims the scheme, and says whether it worked
 
-Nothing here writes a default association. Not `xdg-mime default`, not
-`LSSetDefaultHandlerForURLScheme`, not the bare `nxm` registry key. Seizing the
-scheme is the exact behaviour this tool exists to fix, and a tool that fixes it
-while doing the same thing on the way in is worse than the thing it replaces.
+| Was | Now | Why |
+| --- | --- | --- |
+| "register, never seize": `install` published a desktop entry / bundle / ProgID and wrote **no** default association on any platform, so opening an `nxm://` link gave the user a chooser | `install` publishes **and** claims, as hard as each platform allows, and exits 3 when it could not finish | nxmproxy's whole job is to take `nxm://` and route it. A user who installed it and still got a chooser had a **broken install**, and the old behaviour could not tell them that. |
 
-That means a user with two mod managers gets **a chooser**, and keeps the right
-to change their mind.
+What is still forbidden everywhere, and is enforced by test: **touching another
+mod manager's entry.** Claiming is for nxmproxy. Nothing here edits another
+manager's `[Added Associations]`, its entry for any other scheme, or its
+registration on any platform.
+
+The other half of that change is honesty about the exit code. `install` exits 0
+only when nxmproxy really is the handler *and that was verified from this
+process*. On macOS and on Windows it cannot be, so it exits **3** and prints the
+exact click. Reporting success there is how a broken install gets automated.
+
+### The rule all three platforms obey: ask, then say whether it worked
+
+| Platform | Can it claim? | How | What `install` reports |
+| --- | --- | --- | --- |
+| Linux | **Yes** | `xdg-mime default nxmproxy.desktop x-scheme-handler/nxm`, then read the file back | exit 0 once the file confirms it |
+| macOS | **Yes, but the OS asks** | `LSSetDefaultHandlerForURLScheme`; macOS 12+ prompts | exit 3, always. The call is one-way and cannot be read back |
+| Windows | **No** | It opens `ms-settings:defaultapps` and stops | exit 3, always |
+
+**Why Windows is not worked around.** The effective default lives under
+`HKCU\...\UserChoice`, whose `Hash` is a keyed digest Windows recomputes on
+write and validates on read. No application may write it; `reg add` against it
+fails. This is documented platform policy ("apps cannot change default apps
+without user interaction in system UI"), not an obstacle to route around, and
+nothing here tries. What Windows *does* permit is a correct ProgID plus a
+`RegisteredApplications` entry, which is what makes the application appear in
+Default Apps - and then the user finishes in one click.
+
+**Why GMM's Linux pattern is not copied.** GameMod Manager's own registration
+calls `xdg-mime default` *and* `set_mimeapps_defaults`, which forces the same
+default into three files (`kde-mimeapps.list`, `mimeapps.list`, and the
+data-level `mimeapps.list`). That is how a user with two mod managers ends up
+with one of them buried, un-reversible without hand editing. nxmproxy writes one
+line, in one file, and takes it back out.
 
 ---
 
@@ -98,55 +132,101 @@ arrives byte for byte.
 
 ## Installation and registration
 
+`nxmproxy install` is three steps in one command: publish nxmproxy to the OS,
+take the `nxm://` scheme, and make sure a link has somewhere to go. Each step
+fails independently and the exit code is the worst of them.
+
 ### Linux
 
-`nxmproxy install` writes exactly one file:
+`install` writes exactly two files:
 
 ```
 ~/.local/share/applications/nxmproxy.desktop
     MimeType=x-scheme-handler/nxm;
+
+~/.config/mimeapps.list
+    [Default Applications]
+    x-scheme-handler/nxm=nxmproxy.desktop
 ```
 
-That line is what places nxmproxy in the list the desktop shows when an `nxm://`
-link is opened. It **registers; it does not decide.** nxmproxy never runs
-`xdg-mime default`, never writes a `[Default Applications]` group into any
-`mimeapps.list`, and never force-propagates into another file.
+The first makes nxmproxy *eligible*. The second makes it what the desktop
+opens. `xdg-mime default` writes that line and only that line: no
+`kde-mimeapps.list`, no data-level `mimeapps.list`, nothing forced. That is
+asserted on content, for all three files, by a test that pre-seeds them with
+another mod manager's entries and checks every other line survives.
 
-This is enforced by a test, not by intention: `install` is run inside a
-throwaway `HOME`/XDG tree and the test asserts that the only file that appears is
-the desktop entry, and that **no `mimeapps.list` and no `[Default Applications]`
-group exists anywhere**.
+The exit code is not trusted. `xdg-mime default` exits 0 and **writes nothing**
+when `$XDG_CONFIG_HOME` does not exist, which it does not on a fresh account, so
+`install` creates the directory first and then reads the file back. If the file
+does not say nxmproxy, `install` says so and exits 3.
 
-The one other thing `install` does is run `update-desktop-database` on the
-directory, best effort, to refresh the desktop's cache of desktop files. That is
-a cache, not a record of the user's choice.
+When `xdg-mime` is not installed at all, nxmproxy writes the same one line
+itself, says that it did so, and still reports the truth. That hand-written path
+has its own end-to-end test, with `xdg-mime` removed from `PATH`, because on a
+normal machine it never runs.
 
-### macOS — compiles, but the runtime behaviour is UNVERIFIED
+`uninstall` removes nxmproxy's id from that one key and leaves every other id,
+every other key, and every other group alone. If our id was the only one, the
+key is removed rather than left empty, because `key=;` is a claim on nothing,
+not the absence of a claim.
 
-`install` publishes a minimal `.app` bundle under
-`~/Library/Application Support/nxmproxy/` with an `Info.plist` whose
-`CFBundleURLTypes` declares `nxm`, then calls `lsregister -f` to make the bundle
-**eligible**.
+> What is restored, and what is not: `xdg-mime default` **replaces** the value
+> for a key rather than appending to it, so uninstall cannot put a previous
+> default back - nothing recorded what was there. What survives is the other
+> manager's own `[Added Associations]` entry, which is how the desktop learns it
+> can still offer them. `uninstall` says this rather than implying a full
+> restore.
 
-`LSSetDefaultHandlerForURLScheme` is deliberately **not** called. It is the
-macOS equivalent of `xdg-mime default`: it assigns the scheme outright, there is
-no "suggested", and it buries any other mod manager. `LSHandlerRank` is
-deliberately left as `Alternate` rather than `Owner` or `Default` for the same
-reason.
+### macOS - UNVERIFIED, and it says so
 
-`nxmproxy test` cannot report the current default handler on macOS without
-binding `LSCopyDefaultHandlerForURLScheme`. This fork does not bind it, so `test`
+`install` publishes a minimal `.app` bundle whose `Info.plist` declares `nxm`,
+then calls **`LSSetDefaultHandlerForURLScheme`**, which on macOS 12 and later
+**prompts the user**. The OS asking is the consent step; there is no other
+supported route to a working install.
+
+An earlier version of this fork deliberately refused that call and only ran
+`lsregister`, on the principle that assigning the scheme is the greed this tool
+exists to stop. That was right about the method and wrong about the outcome: it
+left the bundle eligible and unchosen, so `install` reported success over an
+install that routed nothing.
+
+> **Honest status - read before trusting the macOS path.** The FFI was written
+> against Apple's documentation, **not on a Mac**. What CI proves is that it
+> compiles against the SDK and links against CoreFoundation and CoreServices.
+> What nothing proves is what it does: whether the prompt appears, whether it
+> takes the claim when the user agrees, and what `test` reports on a machine
+> where something else already owns `nxm://`. Because the call cannot be read
+> back, `install` **never** reports a verified claim on macOS and always exits 3.
+>
+> **CI found the API is not merely unverified - it is hostile.** On the headless
+> `macos-latest` runner, `LSSetDefaultHandlerForURLScheme` **aborts the process**
+> (killed by a signal, not an error return). LaunchServices needs a GUI session
+> that a CI runner does not have, and the first CI run proved it: two integration
+> tests that run the real binary died, and a unit test that called the API
+> directly took the whole test binary down with SIGTRAP.
+>
+> Two consequences, both permanent and neither hidden:
+>
+> * The unit tests target `decide_claim(status)`, a pure function of the
+>   `OSStatus`, so the suite makes **no** system call. The FFI is a three-line
+>   shell around it. This is the same split `windows.rs` already uses to keep
+>   `reg.exe` out of the tests.
+> * The one integration test that still runs the real `install` on macOS
+>   accepts a process killed by a signal as "needs user", never as success, and
+>   prints a note when it happens. Every other assertion that would have needed
+>   a post-install state was moved to a test that runs on Linux and Windows
+>   instead, or re-expressed through `list --json`, which never calls `install`.
+>   So **the macOS install path is not covered end to end**, and this README
+>   does not claim it is. The assertion that still runs on macOS is the one that
+>   matters most: nxmproxy never reports a claim it cannot verify.
+
+`nxmproxy test` cannot report the current default handler without
+`LSCopyDefaultHandlerForURLScheme`, which this fork does not bind, so `test`
 says so and points at System Settings rather than inventing a boolean.
 
-> **Honest status.** The code was written on a machine with no macOS SDK, so it
-> was never run there by its author. What is now verified: **it compiles on
-> `aarch64-apple-darwin` and the unit tests pass on `macos-latest` in CI.**
-> What is **not** verified, and needs a real Mac and a real click: that
-> `lsregister` makes LaunchServices offer the bundle, in what order the entries
-> appear in the chooser, that the `Alternate` rank has the intended effect, and
-> what `test` reports on a machine where something else already owns `nxm://`.
-> Every one of those is a LaunchServices behaviour, and nothing here exercises
-> LaunchServices.
+`uninstall` removes the bundle and then states plainly that macOS has no
+supported way to *unset* a scheme handler; pointing it elsewhere is the user's
+click.
 
 ### Windows
 
@@ -161,52 +241,158 @@ says so and points at System Settings rather than inventing a boolean.
 | `...\GameModManager.NxmProxy\SupportedTypes` (`nxm`) | |
 | `...\GameModManager.NxmProxy\Capabilities` | |
 | `...\Capabilities\URLAssociations` (`nxm`) | |
-| `HKCU\Software\Microsoft\Windows\CurrentVersion\RegisteredApplications` | Puts us in Default Apps so the shell can offer a choice |
+| `HKCU\...\CurrentVersion\RegisteredApplications` | Puts us in Default Apps so the shell can offer a choice |
 
 `SupportedTypes` plus `RegisteredApplications` plus `Capabilities` is the
-documented shape that makes Windows **offer** the application rather than
-silently taking the scheme, and it is why the "How do you want to open this?"
-chooser can appear.
+documented shape that makes Windows **offer** the application. That part works,
+and it is the whole of what Windows permits.
 
-**Nothing under `HKEY_CLASSES_ROOT` is ever written.** `reg.exe` is used rather
-than the Win32 API, which removes the `windows` crate and its build script, and
-leaves the risky part (exact key names and quoting) as plain argument vectors that
-are unit tested on every platform.
+`install` then opens `ms-settings:defaultapps?registeredAppUser=GameModManager%20NXM%20Proxy`
+- Microsoft's documented URI for the Default Apps page, with the `registeredAppUser`
+parameter added in Windows 11 21H2 that jumps straight to one app's entry. User,
+not machine, because the app is registered under `HKCU` - a machine-scoped
+lookup would not find it. The exact string is asserted by a test on every
+platform, because no Linux build can otherwise see it.
+
+**Nothing under `HKEY_CLASSES_ROOT` is ever written**, and nothing writes
+`UserChoice`, `FileExts` or `App Paths`; a test scans production source for
+those three names. `reg.exe` is used rather than the Win32 API, which removes
+the `windows` crate and its build script and leaves the risky part (exact key
+names and quoting) as plain argument vectors unit tested on every platform.
+
+`uninstall` deletes the ProgID and the `RegisteredApplications` value, then
+states that Windows will not let nxmproxy take the default back: `UserChoice`
+keeps pointing at a ProgID that no longer exists and Windows falls back to its
+own prompt. It does **not** claim to have undone it.
 
 > **Honest status: the Windows path has never been executed against a Windows
-> registry.** It compiles on `x86_64-pc-windows-msvc` and its unit tests pass on
-> `windows-latest` in CI, and the key names, argument construction and per-user
-> scope are asserted by tests. What is **not** verified: that `reg.exe` accepts
-> and writes every key as intended, that Windows then offers nxmproxy in the
-> `nxm://` chooser, and that the `RegisteredApplications` entry behaves. Those
-> need a real machine and a real click.
+> registry by this fork's author.** It compiles on `x86_64-pc-windows-msvc` and
+> its tests pass on `windows-latest`, and key names, argument construction and
+> per-user scope are asserted on every platform. What is **not** verified: that
+> `reg.exe` accepts every key as intended, that the settings page opens, and
+> that Windows then offers nxmproxy in the `nxm://` chooser. Those need a real
+> machine.
 
 ---
 
+## Finding the mod manager
+
+`install` owns `nxm://`. If nothing forwards it, every link goes nowhere, and
+that is a broken install - so `install` does not stop at claiming the scheme.
+
+**The problem is that GMM's binary location is not fixed and there is no stable
+install path on any of the three platforms.** GameMod Manager ships through
+QtIFW to an install prefix that is **not** on `PATH`, is not registered in a
+well-known location on macOS, and on Windows sits under `Program Files`. So
+guessing a path produces a manager that is registered, cannot be started, and
+silently eats every download.
+
+What was considered:
+
+| Option | Verdict |
+| --- | --- |
+| Ship GMM pre-registered in the default config | **Rejected.** It hardcodes a path that is wrong on most machines, so the default is broken more often than it works - and a broken default is worse than no default, because it fails at click time rather than at install time |
+| Require the user to run `register` first | **Rejected as the whole answer.** It is the correct *fallback* and remains one, but an out-of-the-box install that routes nothing is a broken install |
+| Ask the OS who currently handles `nxm://` | **Rejected.** On Windows that returns a command line, and parsing it means reintroducing the `CommandLineToArgvW` quoting this fork deleted upstream's use of. On macOS it is not readable at all |
+| **Auto-detect from the manager's own desktop entry** | **Chosen** |
+
+The chosen approach reads the XDG desktop entry the manager writes for itself.
+GameMod Manager writes
+`~/.local/share/applications/gamemodmanager-nxm.desktop` when the user enables
+its nxm handling, and that file contains its real `Exec=` line. So the path is
+not guessed: it is read from the only place it is recorded. This is the signal
+that works when `PATH` does not, which is the case that actually occurs.
+
+The rules are deliberately narrow, because every wider rule is worse:
+
+* **Only when the configuration has no managers at all.** A user who configured
+  something has already answered this question, and `install` never extends a
+  configuration it did not create.
+* **Only when exactly one candidate is provably present.** Two managers is
+  ambiguous, and a wrong guess is a download in someone else's mod queue. That
+  is `Route::Ambiguous`'s whole argument, and `install` must not invent the very
+  ambiguity it refuses to resolve at click time.
+* **Only when the executable really resolves.** Registering a manager that cannot
+  be started is the broken install this exists to prevent.
+* **Only when the parsed argv contains `%1`.** A manager that never receives the
+  link would be started for every download and handed nothing.
+* Otherwise: **refuse, and print the exact command to type.** A refusal with
+  instructions beats a guess, and it exits 3 so a script knows.
+
+With exactly one registered manager, routing rule 3 sends every unassigned
+domain to it, so a fresh install routes with no further configuration.
+
+> **Where this does not work, stated plainly.** The desktop-entry signal is a
+> Linux mechanism. On macOS and Windows there is no equivalent file, so unless
+> the manager is on `PATH`, `install` finds nothing, prints the `register`
+> command, and exits 3. That is a real asymmetry, not a claim of parity: on those
+> two platforms an out-of-the-box install still needs one typed command. The
+> alternative - guessing at a `Program Files` path or scanning an `.app` bundle -
+> would be a guess, and this tool does not guess.
+
+`nxmproxy list --json` reports the same judgement per entry as `present`, so a
+GUI can offer the same one-click register.
+
 ## Command line
 
-| Command | Description |
+| Command | Meaning |
 | --- | --- |
-| `install` | Register nxmproxy as a handler for `nxm://`. Registers; does not seize. |
-| `uninstall` | Remove what `install` created, and nothing else. |
+| `install` | Install nxmproxy as the `nxm://` handler: full configuration **and** claim. |
+| `uninstall` | Remove nxmproxy as the handler (symmetric with `install`). |
+| `register <name> <exec> [-- <args>...]` | Add a mod manager. |
+| `unregister <name>` | Remove a mod manager, and its game assignments. |
+| `assign <manager> <domain>` | Routing. `<domain>` is the `nexusmods.com` subdomain, or `_` for every game with no assignment. |
+| `list [--json]` | The routing table. `--json` is the machine-readable contract. |
 | `test` | Report whether nxmproxy is registered and who the OS says handles `nxm://`. Exit 0 if registered, 1 if not. |
-| `list [--json]` | Show the routing table. `--json` is the machine-readable contract. |
-| `register-manager <name> <exec> [-- <args>...]` | Register a mod manager. Alias: `register`. |
-| `unregister-manager <name>` | Remove a manager and its assignments. Alias: `deregister`. |
-| `assign <manager> <domain>` | Assign a domain. `<domain>` is the `nexusmods.com` subdomain, or `_` for every game with no assignment. |
 | `pipe <manager> <pipe>` | Give a manager a named pipe to try before spawning it. |
 | `url <nxm url>` | Forward a link. This is what the OS invokes. |
 
 `%1` inside any element of `args` is where the link goes. Use `--` before the
 argument vector so a link or flag-looking argument is never parsed as an option.
 
+### Names: upstream, and this fork
+
+Upstream (`TanninOne/nxmproxy`, `src/main.rs`, HEAD `f9f72e0`) had
+`Url`, `Register`, `Deregister`, `Assign`, `Pipe`, `Install` and `Test`. The
+mapping, verified against that source:
+
+| Upstream | Here | Change |
+| --- | --- | --- |
+| `Url` | `url` | - |
+| `Register { manager, command }` | `register <name> <exec> [-- <args>...]` | **Same name, different arguments.** Upstream's took a command *string*; this takes an exec plus an argv vector |
+| `Deregister { manager }` | `unregister <name>` | Renamed. It removes rather than deregisters |
+| `Assign` | `assign` | - |
+| `Pipe` | `pipe` | - |
+| `Install` | `install` | **Same name, much more.** Upstream wrote `HKCR\nxm` and elevated itself; this publishes a per-user ProgID, then claims the scheme |
+| `Test` | `test` | - |
+| *(none)* | `uninstall` | Added. Upstream could not uninstall: its `deregister` removed the manager from its config and left the registry key behind |
+| *(none)* | `list` | Added |
+
+So there was no collision to resolve: upstream already used `register` for a mod
+manager, and `Install` for the scheme. `register-manager` was this fork's own
+interim name, and it is **removed outright** rather than kept as an alias -
+a command that keeps working after being renamed is a second surface nobody
+documents. `deregister` and `unregister-manager` are gone for the same reason.
+A test asserts each of them now exits 2.
+
 ### Exit codes
 
-| Code | Meaning |
-| --- | --- |
-| 0 | Delivered, or the command succeeded. |
-| 1 | Not delivered, or the command failed. **Never a panic.** |
-| 2 | Bad command line (from `clap`). |
+| Code | Name | Meaning |
+| --- | --- | --- |
+| 0 | ok | Delivered, or the command succeeded and the result was verified. |
+| 1 | failed | Not delivered, or the command failed. **Never a panic.** |
+| 2 | usage | Bad command line (from `clap`). |
+| 3 | needs-user | **Registered, but the OS requires one step you must do by hand.** Nothing failed; nxmproxy did everything the platform allows |
+
+Code 3 is what makes `install` scriptable. It is deliberately neither 1 nor 0:
+
+* not **1**, because nothing went wrong - a wrapper that aborts on 1 would treat
+  a normal macOS or Windows install as a failure;
+* not **0**, because on macOS and Windows nxmproxy cannot verify the claim, and
+  a wrapper that reads 0 would automate an install that routes nothing.
+
+The same code also covers "no mod manager to forward to", because typing
+`nxmproxy register ...` is exactly such a step. The message always says which.
 
 ### Routing rules
 
@@ -340,21 +526,103 @@ Every CLI test runs in a throwaway config directory and a throwaway
 `cargo build --release` and `cargo test` on **Linux, macOS and Windows**.
 
 > **What the CI run proves on macOS and Windows, precisely:** the crate compiles
-> there, and every test that does not need a real OS passes. The unit tests for
-> the macOS plist and the Windows registry operations are pure functions over
-> text, so they run and pass on all three platforms.
+> there, and every test that does not need a real OS passes. The macOS plist, the
+> macOS `LSSetDefaultHandlerForURLScheme` decision, the Windows registry
+> operation list and the Windows Default Apps URI are all pure functions over
+> text and decisions, so they compile and pass on all three platforms - which is
+> why the rule that **macOS and Windows never report a verified claim** is
+> enforced from a Linux build rather than only on the platform it concerns.
 >
-> **What it does not prove:** that `lsregister` makes macOS offer the bundle, or
-> that `reg.exe` writes the Windows keys as intended. The `tests/cli.rs`
-> registration round trip runs on macOS and Windows but only exercises the
-> platform module that can actually perform the write, so on those two it
-> verifies the CLI contract rather than the OS integration. Both need a real
-> machine and a real click.
+> **What it does not prove:** that `LSSetDefaultHandlerForURLScheme` makes macOS
+> offer the bundle, that the prompt appears, or that `reg.exe` writes the Windows
+> keys as intended. The `tests/cli.rs` round trip is compiled out on macOS,
+> because `install` is killed there before it prints anything; it runs on Linux
+> and Windows, verifying the CLI contract and the exit codes rather than the OS
+> integration. On macOS the detection decision is covered instead through
+> `list --json`. Those OS integrations need a real machine and a real click.
 >
-> This split is not hypothetical. The first CI run failed on both: the Windows
-> named-pipe path was missing its `io::Write` import, which no Linux build can
-> see because the function is `#[cfg(windows)]`, and would have failed to compile
-> for every Windows user.
+> This split is not hypothetical. The **first CI run of the claiming work failed
+> on all three platforms**, and every failure was one a Linux build could not
+> see:
+>
+> * macOS: the unit tests made a real LaunchServices call and the binary died
+>   with SIGTRAP before printing a test name.
+> * macOS: two integration tests died because the real binary aborts on a
+>   headless runner.
+> * Windows: tests that run `install` share one real `HKCU` and the sandbox
+>   cannot isolate it, so cargo's parallel threads overwrote each other and `test`
+>   reported registered before anything had been installed.
+> * Linux: the argv-recording test waited for a file to *exist* rather than to be
+>   finished, so on a loaded runner it read a half-written argv and reported a
+>   link that had lost its URL. It had been green locally for months.
+>
+> An earlier run failed the same way: the Windows named-pipe path was missing its
+> `io::Write` import, which no Linux build can see because the function is
+> `#[cfg(windows)]`, and would have failed to compile for every Windows user.
+
+### Negative controls
+
+Every load-bearing test has a mutation control that proves it can actually go
+red. The controls are mutation-and-observe, not assertion-counting:
+
+| # | Mutation | Test that catches it |
+| --- | --- | --- |
+| 1 | `install` force-propagates the claim into all three mimeapps files (GMM's anti-pattern) | `linux_install_claims_the_scheme_in_one_file_and_buries_nobody` |
+| 2 | the claim deletes another mod manager's lines | `the_fallback_claim_path_buries_nobody_either` |
+| 3 | `uninstall` deletes another manager's line | `linux_uninstall_removes_only_our_line` |
+| 4 | the file editor drops other lines | `setting_a_default_leaves_every_other_line_byte_for_byte` |
+| 5 | a claim that needs the user exits 0 | `only_a_verified_claim_exits_zero` |
+| 6 | `Claim::needs_user` reports a verified claim | `windows_never_reports_a_claim_it_could_not_make`, `a_claim_is_never_reported_as_verified` |
+| 7 | the "no manager, so nothing is routed" guard is removed | `install_never_calls_a_routing_setup_done` |
+| 8 | `register-manager` survives as an alias | `the_command_names_are_the_final_surface_and_the_old_ones_are_gone` |
+| 9 | the `$XDG_CONFIG_HOME` fix is removed, restoring `xdg-mime`'s silent no-op | `install_and_uninstall_round_trip` |
+| 10 | `present` is satisfied by a desktop entry that merely exists | `a_manager_is_detected_only_when_it_can_be_proven_present` |
+| 11 | detection accepts an `Exec` line with no `%1` | `install_refuses_a_manager_it_could_not_use` |
+| 12 | detection fires on a configuration the user built | `install_refuses_a_manager_it_could_not_use` |
+| 13 | detection registers a manager whose executable does not resolve | `install_refuses_a_manager_it_could_not_use` |
+
+One control is deliberately reported as **green**, and that is the point of
+running them at all. Breaking `Claim::exit_code` to always return 0 did **not**
+turn `install` green, because the "no manager, so nothing is routed" guard sets
+exit 3 independently. Removing that routing guard instead *does* turn `install`
+green at 0, so the two are genuinely independent and either one holds the line
+alone. The same mutation is not harmless overall: it still fails five unit tests
+and the two `uninstall` tests, which assert `needs_user` with no routing guard to
+back them up. That is defence in depth working, and it is also a reminder that a
+control only proves what the test it targets actually asserts - control 6 above
+exists for the exit code itself.
+
+The rest found real bugs while they were being written:
+
+* Control 9 reproduced a live defect: `xdg-mime default` exits **0 and writes
+  nothing** when `$XDG_CONFIG_HOME` is missing, which is the state of a fresh
+  account - its only complaint goes to stderr. `install` claimed a scheme it had
+  not claimed. Fixed by creating the directory first, and the read-back now
+  catches it if that regresses.
+* Control 2 came back **green** the first time, which proved the test was not
+  running where the logic lives: with `xdg-mime` installed, `install` delegates
+  the edit entirely and nxmproxy's own editor never executes. That left the
+  hand-written fallback path - the one used on minimal systems, and the one this
+  project wrote itself - with no end-to-end coverage at all.
+  `the_fallback_claim_path_buries_nobody_either` was added to close it, and
+  control 2 goes red against it now.
+* Control 10 caught `list --json` and `install` **disagreeing** about what
+  "present" means: the JSON was satisfied by a desktop entry merely existing,
+  while `install` also required the executable to resolve. Both now share one
+  helper and one bar.
+
+### Known coverage gap
+
+`unclaim` does its own per-id filtering to decide which other managers survive on
+the `[Default Applications]` line, and **that filter has no test**. Breaking it
+so it keeps nothing leaves all 87 tests green, because the `uninstall` fixtures
+never put a second manager on the same `[Default Applications]` nxm key - the
+shared-key case is only exercised one level down, against `set_default_ids`
+directly, which is not the code path `unclaim` uses. Reaching it needs a
+`[Default Applications]` line reading `nxm=vortex.desktop;nxmproxy.desktop;`, which
+`xdg-mime` never writes (it replaces rather than appends) but a hand-edited file
+can contain. The code is correct by inspection; it is simply not defended by a
+control.
 
 ---
 
