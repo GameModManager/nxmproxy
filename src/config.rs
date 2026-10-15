@@ -238,7 +238,7 @@ impl Config {
         if !self.managers.contains_key(manager_id) {
             return Err(format!(
                 "no mod manager named {:?} is registered; \
-                 register it first with: nxmproxy register-manager {manager_id} <exec> [<args>...]",
+                 register it first with: nxmproxy register {manager_id} <exec> [<args>...]",
                 manager_id
             ));
         }
@@ -532,7 +532,7 @@ solved = "ghost"
         let mut cfg = Config::default();
         let err = cfg.assign("ghost", "skyrimse").unwrap_err();
         assert!(
-            err.contains("register-manager"),
+            err.contains("register"),
             "message must be actionable: {err}"
         );
     }
