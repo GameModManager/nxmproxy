@@ -525,7 +525,7 @@ by declaration.
 | `list [--json]` | The routing table. `--json` is the machine-readable contract. |
 | `test` | Report whether nxmproxy is registered and who the OS says handles `nxm://`. Exit 0 if registered, 1 if not. |
 | `pipe <manager> <pipe>` | Give a manager a named pipe to try before spawning it. |
-| `url <nxm url>` | Forward a link. This is what the OS invokes. |
+| `url <nxm url>`, or bare `<nxm url>` | Forward a link. The bare form is one argument and is what a hand-written or third-party `Exec=nxmproxy %u` hands over; the `url` form is what nxmproxy's own desktop entry invokes. |
 
 `list` prints the routing table and nothing else:
 

@@ -20,7 +20,7 @@ mod xdg;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
-use clap::{Parser, Subcommand};
+use clap::{CommandFactory, Parser, Subcommand};
 
 use config::{Config, Manager};
 use platform::Status;
@@ -45,16 +45,32 @@ const LIST_SCHEMA_VERSION: u32 = 5;
                     2  bad command line\n  \
                     3  registered, but the OS requires one step you must do by hand\n\
                        (the message says which). Nothing failed; nxmproxy did all the\n\
-                       platform allows."
+                       platform allows.",
+    args_conflicts_with_subcommands = true
 )]
 struct Cli {
+    /// An nxm:// link to forward. The same command as `nxmproxy url <url>`.
+    ///
+    /// This is the form the changelog has always documented and the form a
+    /// hand-written or third-party `Exec=nxmproxy %u` hands over. Upstream made
+    /// the link a *subcommand* named `url`, so `nxmproxy nxm://...` was parsed
+    /// as a subcommand called `nxm://...` and refused with
+    /// "unrecognized subcommand" - a surface its own documentation contradicts.
+    /// Both spellings work now: clap gives the subcommand priority when the
+    /// first word names one, and fills this positional when it does not.
+    url: Option<String>,
+
     #[command(subcommand)]
-    command: Command,
+    command: Option<Command>,
 }
 
 #[derive(Subcommand, Debug)]
 enum Command {
     /// Forward an nxm:// link to the mod manager assigned for its game.
+    ///
+    /// An alias for the bare `nxmproxy <nxm://url>`, kept because this is the
+    /// form the desktop entry nxmproxy publishes uses, and because it is what
+    /// the surface has always said this subcommand is.
     Url {
         /// The nxm:// link to forward.
         url: String,
@@ -1303,7 +1319,24 @@ fn run() -> i32 {
         }
     };
 
-    match cli.command {
+    // Two spellings, one command: `nxmproxy <url>` and `nxmproxy url <url>`.
+    //
+    // Folding them together here, once, is why the rest of this function still
+    // matches on `Command` alone. `args_conflicts_with_subcommands` means clap
+    // refuses a link *and* a command on one line, so the two remaining states
+    // are the two real ones plus "neither", which is an empty command line.
+    let command = match (cli.url, cli.command) {
+        (Some(url), None) => Command::Url { url },
+        (None, Some(command)) => command,
+        _ => Cli::command()
+            .error(
+                clap::error::ErrorKind::DisplayHelpOnMissingArgumentOrSubcommand,
+                "an nxm:// link, or a command",
+            )
+            .exit(),
+    };
+
+    match command {
         Command::Url { url } => handle_url(&config, &url),
 
         Command::Install => handle_install(&mut config, &save),

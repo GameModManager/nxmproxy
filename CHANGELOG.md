@@ -22,6 +22,13 @@
 
 ### Fixed
 
+* **`nxmproxy <nxm://url>` works.** The command surface has documented the bare
+  form since 0.2.0 and it did not run: upstream made the link a *subcommand*
+  named `url`, so `nxmproxy nxm://helldivers2/...` was parsed as a subcommand
+  called `nxm://helldivers2/...` and refused with `error: unrecognized
+  subcommand`. Both spellings work now - the bare form, and `url <url>`, which
+  is what the desktop entry nxmproxy publishes invokes and what the surface has
+  always named. Nothing else about the command moved.
 * `Exec=` is read from the `[Desktop Entry]` group and nowhere else. An action
   group carries its own `Exec=` - HD2Arsenal's `[Desktop Action Uninstall]`
   runs `AppManager uninstall` - and delivering an nxm link to that asks a

@@ -423,6 +423,59 @@ fn an_unroutable_link_exits_with_a_message_and_never_panics() {
     );
 }
 
+/// `nxmproxy <url>` is not a subcommand called `<url>`.
+///
+/// Upstream made the link a subcommand named `url`, so the bare form the
+/// changelog documents since 0.2.0 was parsed as a subcommand *named* by the
+/// link and refused with "unrecognized subcommand". Both spellings deliver the
+/// same link, to the same manager, as the same one argument - which is what
+/// makes the bare form safe to put in an `Exec=` line.
+#[cfg(unix)]
+#[test]
+fn the_bare_url_and_the_url_subcommand_deliver_identically() {
+    let sandbox = Sandbox::new("bare-url");
+    let (recorder, argv_file) = argv_recorder(&sandbox, "recorder.sh");
+    let link = "nxm://helldivers2/mods/14359/files/59437?key=k&expires=1&user_id=2";
+
+    run(&sandbox, &["register", "recorder", &recorder, "%U"]);
+    run(&sandbox, &["assign", "recorder", "helldivers2"]);
+
+    let bare = run(&sandbox, &[link]);
+    assert_eq!(code(&bare), 0, "{}", stderr(&bare));
+    assert!(
+        wait_for(&argv_file, "DONE", Duration::from_secs(10)),
+        "the manager never finished recording its argv: {}",
+        std::fs::read_to_string(&argv_file).unwrap_or_default()
+    );
+    assert_eq!(
+        std::fs::read_to_string(&argv_file)
+            .unwrap()
+            .lines()
+            .collect::<Vec<_>>(),
+        vec![link, "DONE"],
+        "the bare form must deliver the link as exactly one argument"
+    );
+
+    // And the subcommand is not the thing that got removed to make room for it.
+    // Re-recording into the same file would only prove one of the two ran.
+    std::fs::write(&argv_file, "").unwrap();
+    let aliased = run(&sandbox, &["url", link]);
+    assert_eq!(code(&aliased), 0, "{}", stderr(&aliased));
+    assert!(
+        wait_for(&argv_file, "DONE", Duration::from_secs(10)),
+        "`url <link>` stopped working: {}",
+        std::fs::read_to_string(&argv_file).unwrap_or_default()
+    );
+    assert_eq!(
+        std::fs::read_to_string(&argv_file)
+            .unwrap()
+            .lines()
+            .collect::<Vec<_>>(),
+        vec![link, "DONE"],
+        "both spellings must deliver the same thing"
+    );
+}
+
 /// Upstream substituted the url into a command *string* and then split the
 /// string with the Win32 parser, so a url containing a double quote became a
 /// different, wrong argument vector. This asserts on what the target process
@@ -1231,7 +1284,15 @@ fn install_says_plainly_when_it_could_not_take_the_claim() {
     let sandbox = Sandbox::new("claim-refused");
     let _lock = install_sandbox(&sandbox);
     std::fs::create_dir_all(sandbox.xdg_config_home()).unwrap();
-    std::fs::write(sandbox.mimeapps(), CONFLICTING_MIMEAPPS).unwrap();
+    // **BYPASSED, not conflicting.** This fixture has to start out with
+    // somebody *else* already holding `[Default Applications]`, because the
+    // case under test is "the write did not happen, so nxmproxy still is not
+    // the handler". It used to seed [`CONFLICTING_MIMEAPPS`], which already has
+    // nxmproxy in `[Default Applications]` - so nxmproxy had won before the
+    // read-only lock was even applied, the refusal never existed to be
+    // observed, and the read back at the end honestly reported the claim as
+    // taken. The test was asserting the opposite of what it was named for.
+    std::fs::write(sandbox.mimeapps(), BYPASSED_MIMEAPPS).unwrap();
 
     // **Deny the write, then prove the denial.** This test used to write the
     // fixture, find the sandbox was still writable, print a note and `return` -
@@ -1262,7 +1323,7 @@ fn install_says_plainly_when_it_could_not_take_the_claim() {
     assert!(
         text.contains(&format!(
             "nxm:// still opens with gamemodmanager-nxm.desktop, from \
-             [Added Associations] of {}",
+             [Default Applications] of {}",
             sandbox.mimeapps().display()
         )),
         "install must name who still holds the scheme and where it says so: {text}"
