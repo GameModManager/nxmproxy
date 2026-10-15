@@ -1,0 +1,143 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
+# Fork of https://github.com/TanninOne/nxmproxy - see NOTICE.md
+
+# Produces the Linux binary users download. Nothing here creates a tag and
+# nothing here is required to test anything: a tag says "this version is real",
+# which is a human decision, so the pipeline sits unused until someone makes it.
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+  # Builds the same artifact and uploads it as a workflow artifact, but
+  # publishes nothing. This is how the pipeline is proved before a release
+  # exists: run it from Actions, download the artifact, run it.
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Tag to build from (blank = the ref the run started on)"
+        required: false
+        default: ""
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: "0"
+  # The same standard the build on main is held to.
+  RUSTFLAGS: "-D warnings"
+
+jobs:
+  linux-x86_64:
+    name: Linux x86_64 (static)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.tag || github.ref }}
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-unknown-linux-musl
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: musl-release
+
+      # musl, statically linked, and not glibc.
+      #
+      # A glibc build of this crate made on this runner links against
+      # GLIBC_2.39 and will not start on Ubuntu 22.04 (2.35), Debian 12 (2.36)
+      # or anything older - "version `GLIBC_2.39' not found", for a program the
+      # user could have run. nxmproxy uses no C library facility that musl
+      # lacks: no NSS, no locale collation, no dlopen, no threads beyond what
+      # musl provides. So the binary links nothing and runs anywhere, at a cost
+      # of roughly 400 KB.
+      - name: Build
+        run: cargo build --release --target x86_64-unknown-linux-musl
+
+      - name: Package
+        run: |
+          VERSION="$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[0].version')"
+          NAME="nxmproxy-${VERSION}-linux-x86_64"
+          mkdir -p dist
+          install -m 755 target/x86_64-unknown-linux-musl/release/nxmproxy "dist/$NAME"
+          # GPL-3 travels with a distributed binary: the licence text and the
+          # upstream attribution are uploaded next to it on the same release.
+          cp LICENSE.md NOTICE.md dist/
+          ( cd dist && sha256sum "$NAME" > SHA256SUMS )
+          {
+            echo "VERSION=$VERSION"
+            echo "NAME=$NAME"
+          } >> "$GITHUB_ENV"
+          cat dist/SHA256SUMS
+
+      # A binary that compiled is not a binary that runs. Alpine has no glibc
+      # at all, so this is the cheapest honest check there is: if anything in
+      # the build had picked up a shared library, this is where it dies, and it
+      # dies here rather than on a user's desktop.
+      - name: It has to run on a machine that has nothing
+        run: |
+          BIN="dist/$NAME"
+          file "$BIN" || true
+          # A dynamically linked binary always prints `lib => /path`. A static
+          # one never does, whatever glibc version prints what in its place.
+          if ldd "$BIN" 2>&1 | grep -q '=>'; then
+            echo "::error::$BIN links a shared library; it would need the runner's libc"
+            exit 1
+          fi
+          docker run --rm --network=none -v "$PWD/dist:/dist:ro" alpine "/dist/$NAME" --version
+
+      - name: Upload the artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: nxmproxy-${{ env.VERSION }}-linux-x86_64
+          path: dist/
+          if-no-files-found: error
+
+      # Tag pushes only. A manual run stops at the artifact above.
+      - name: Attach it to the release
+        if: github.event_name == 'push'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          {
+            echo "## nxmproxy $VERSION"
+            echo
+            echo "One static Linux x86_64 binary. No installer, no dependencies, no daemon:"
+            echo "it links no C library, so it runs on any Linux distribution, of any age,"
+            echo "glibc or musl."
+            echo
+            echo '```sh'
+            echo "base=${{ github.server_url }}/${{ github.repository }}/releases/download/$GITHUB_REF_NAME"
+            echo "curl -LO \$base/$NAME"
+            echo "curl -LO \$base/SHA256SUMS"
+            echo "sha256sum -c SHA256SUMS && chmod +x $NAME"
+            echo "sudo install -m 755 $NAME /usr/local/bin/nxmproxy   # or: any directory on \$PATH"
+            echo "nxmproxy install"
+            echo '```'
+            echo
+            echo "Then add your mod manager, for example:"
+            echo
+            echo '```sh'
+            echo "nxmproxy register vortex '/usr/bin/vortex' %U"
+            echo '```'
+            echo
+            echo "Build: \`$GITHUB_SHA\` (\`$GITHUB_REF_NAME\`). SHA256 of the binary:"
+            echo
+            echo '```'
+            cat dist/SHA256SUMS
+            echo '```'
+            echo
+            echo "**Licence: GPL-3.0-or-later.** The full text is attached to this release as"
+            echo "\`LICENSE.md\`, upstream's, retained verbatim."
+            echo
+            echo "**Attribution.** This is a fork of [NXMProxy](https://github.com/TanninOne/nxmproxy)"
+            echo "by Tanner Parnell, Copyright (c) 2021 Tanner Parnell, GPL-3.0-or-later. Upstream's"
+            echo "four commits are preserved in this repository's history; see \`NOTICE.md\` for what"
+            echo "was kept, what was fixed and what was removed. The complete corresponding source"
+            echo "is at ${{ github.server_url }}/${{ github.repository }} at tag \`$GITHUB_REF_NAME\`."
+          } > notes.md
+          gh release create "$GITHUB_REF_NAME" dist/* \
+            --verify-tag --title "nxmproxy $VERSION" --notes-file notes.md

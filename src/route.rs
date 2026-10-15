@@ -14,7 +14,7 @@
 
 use std::process::{Command, Stdio};
 
-use crate::config::{Config, Manager, CATCH_ALL};
+use crate::config::{substitute_url, Config, Manager, CATCH_ALL};
 use crate::logger;
 use crate::pipe;
 
@@ -147,16 +147,19 @@ pub fn domain_of(url: &str) -> Result<String, String> {
 
 /// Substitute the url into the manager's argument vector.
 ///
-/// `%1` is replaced **inside one element**. Upstream did
-/// `command.replace("%1", url)` and then split the resulting string with the
-/// Win32 parser, so a url containing a double quote produced a different and
-/// wrong argument vector. Holding the command as a vector and touching a
-/// single element cannot corrupt it.
+/// The field code is replaced **inside one element**, never by splitting a
+/// string. Upstream did `command.replace("%1", url)` and then split the
+/// resulting string with the Win32 parser, so a url containing a double quote
+/// produced a different and wrong argument vector. Holding the command as a
+/// vector and touching a single element cannot corrupt it.
+///
+/// `%u` and `%U` mean the same thing as `%1`; see
+/// [`crate::config::substitute_url`].
 pub fn spawn_args(manager: &Manager, url: &str) -> (String, Vec<String>) {
     let args = manager
         .args
         .iter()
-        .map(|arg| arg.replace("%1", url))
+        .map(|arg| substitute_url(arg, url))
         .collect();
     (manager.exec.clone(), args)
 }
@@ -361,6 +364,41 @@ mod tests {
         let manager = mgr("m", &["%1", "--also", "%1"]);
         let (_, args) = spawn_args(&manager, "nxm://g/mods/1");
         assert_eq!(args, vec!["nxm://g/mods/1", "--also", "nxm://g/mods/1"]);
+    }
+
+    #[test]
+    fn the_desktop_entry_spellings_of_the_field_code_all_substitute() {
+        // `%u` and `%U` are what an Electron, AppImage or Flatpak entry
+        // writes, so they are what a user copies into `register`. Before this,
+        // only `%1` substituted: the manager started, and the link went
+        // nowhere, silently.
+        for code in ["%1", "%u", "%U"] {
+            let (_, args) = spawn_args(&mgr("m", &[code]), "nxm://g/mods/1");
+            assert_eq!(args, vec!["nxm://g/mods/1"], "{code} did not substitute");
+            // And the manager is not reported as one that would never see a
+            // link: `takes_url` is the contract a GUI warns the user with.
+            assert!(mgr("m", &[code]).takes_url(), "{code} reads as no link");
+        }
+        // Mid-string too, the form `npm run start -- %U` style entries use.
+        let (_, args) = spawn_args(&mgr("m", &["--open=%U"]), "nxm://g/mods/1");
+        assert_eq!(args, vec!["--open=nxm://g/mods/1"]);
+        // A bare `%` that is not a field code is left alone rather than
+        // swallowed: `--progress 50%` is not a link.
+        let (_, args) = spawn_args(&mgr("m", &["%"]), "nxm://g/mods/1");
+        assert_eq!(args, vec!["%"]);
+        assert!(!mgr("m", &["50%"]).takes_url());
+    }
+
+    #[test]
+    fn substitution_is_one_pass_so_a_url_containing_a_field_code_survives() {
+        // The url is untrusted input from a browser. Replacing `%u` after
+        // `%1` was already expanded would substitute into the text the url
+        // itself brought with it, and hand the manager a different url.
+        let url = "nxm://g/mods/1/files/2?name=50%user";
+        let (_, args) = spawn_args(&mgr("m", &["%U"]), url);
+        assert_eq!(args, vec![url], "the url must arrive byte for byte");
+        let (_, args) = spawn_args(&mgr("m", &["%1"]), url);
+        assert_eq!(args, vec![url]);
     }
 
     #[test]
