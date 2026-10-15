@@ -1,5 +1,58 @@
 # Changelog
 
+## 0.3.0
+
+### Added
+
+* **Any mod manager, found by its own declaration.** A manager is detected
+  because its desktop entry carries `MimeType=x-scheme-handler/nxm`, the XDG
+  declaration of "I take nxm links", published by the application itself.
+  Until now only the one entry hardcoded into `src/defaults.rs` could ever be
+  found, so a third-party manager such as HD2Arsenal was undetectable from any
+  input. Detection scans `XDG_DATA_HOME/applications`, every
+  `XDG_DATA_DIRS` entry, `~/.local/share/applications` and
+  `XDG_CONFIG_HOME/applications`.
+* **`discover`.** Finds every manager this machine declares and remembers each
+  one as assigned to no game. Found is not chosen: a remembered manager routes
+  nothing until `assign`, is never offered as one of the choices when the answer
+  is ambiguous, and `resolve` refuses rather than guessing. Safe to re-run - an
+  id that is already known is left exactly as it is, and nothing is ever removed.
+* `list` reports which managers were found and which were chosen. `list --json`
+  is version 3 and carries `managers[].discovered`.
+
+### Fixed
+
+* `Exec=` is read from the `[Desktop Entry]` group and nowhere else. An action
+  group carries its own `Exec=` - HD2Arsenal's `[Desktop Action Uninstall]`
+  runs `AppManager uninstall` - and delivering an nxm link to that asks a
+  package manager to delete the user's mod manager.
+* `Exec=` is parsed quote-aware, so an executable path containing a space is one
+  argument rather than two.
+* `MimeType` is read from any group, because AppImage packaging puts it in an
+  action group rather than in `[Desktop Entry]`, and a strict group-only reader
+  did not see HD2Arsenal at all. The asymmetry is safe: the argv still comes
+  from `[Desktop Entry]`, so a stray `MimeType` can never make an uninstall
+  action something nxmproxy spawns.
+* A duplicated `x-scheme-handler/nxm` is one handler, not two candidates.
+* nxmproxy never detects itself, which `install` would otherwise cause by
+  publishing its own entry before detection runs.
+* `~/.local/bin` is searched when resolving an executable and reported by
+  `list`, but is never a detection source: what is in it says a program runs,
+  not that it takes a link.
+* A manager whose application is uninstalled stays in the list, reported
+  unavailable, instead of silently disappearing from it.
+
+### Changed
+
+* Output trimmed to state. `list` prints the config path, the managers, and the
+  games under each manager. The local-bin inventory line, the per-manager
+  provenance notes, the closing lesson, the advice under the candidate list and
+  the trailing hints on `install`, `register` and `test` are gone: each was
+  telling a user something the command had already done.
+* `install` points at `discover` rather than running it. It never extends a
+  configuration it did not create, and a second hidden write path inside
+  `install` is how that rule gets lost.
+
 ## 0.2.0
 
 First tagged release of this fork of
