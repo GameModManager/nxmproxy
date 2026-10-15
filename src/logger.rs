@@ -1,61 +1,68 @@
-use std::{fs::{File, OpenOptions}, io::{Error, Write}, sync::Mutex};
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2021 Tanner Parnell (upstream, TanninOne/nxmproxy)
+// Copyright (C) 2026 The GameModManager community (this fork)
+// Fork of https://github.com/TanninOne/nxmproxy - see NOTICE.md
 
-use once_cell::sync::Lazy;
+//! A small file logger.
+//!
+//! Upstream's hand-rolled logger is kept, minus the `once_cell` dependency:
+//! `std::sync::OnceLock` does the same job from the standard library.
+//!
+//! The log matters more than it looks. We are launched by the OS with no
+//! terminal attached and we exit in milliseconds, so when a link does not
+//! arrive the only place the reason can live is here.
 
-/// Yes yes, there is a log crate, why the DIY crap?
-/// Because the log crate more than doubles the final executable size for some logging
-/// that likely noone ever reads, that's why
+use std::fs::OpenOptions;
+use std::io::Write;
+use std::sync::{Mutex, OnceLock};
 
-pub struct Logger {
-    file: Option<File>
+static SINK: OnceLock<Mutex<Option<std::fs::File>>> = OnceLock::new();
+
+fn sink() -> &'static Mutex<Option<std::fs::File>> {
+    SINK.get_or_init(|| Mutex::new(None))
 }
 
-impl Logger {
-    pub fn set_file(self: & mut Logger, file_path: &str) {
-        self.file = OpenOptions::new()
-            .write(true)
-            .append(true)
-            .create(true)
-            .open(file_path)
-            .ok();
-    }
+/// Log to `path` from now on, creating it if needed. Failure is not an error:
+/// we fall back to stderr rather than refusing to run.
+pub fn set_file(path: &std::path::Path) {
+    let file = OpenOptions::new().create(true).append(true).open(path).ok();
+    *sink().lock().unwrap() = file;
+}
 
-    pub fn log(self: & mut Logger, level: &str, message: &str) -> Result<(), Error> {
-        match self.file.as_mut() {
-            Some(f) => f.write(format!("{}: {}\n", level, message).as_bytes()).and(Ok(())),
-            None => {
-                println!("{}: {}", level, message);
-                Ok(())
-            },
+fn log(level: &str, message: &str) {
+    let mut guard = sink().lock().unwrap();
+    match guard.as_mut() {
+        Some(file) => {
+            let _ = writeln!(file, "{level}: {message}");
+            let _ = file.flush();
         }
+        None => eprintln!("{level}: {message}"),
     }
 }
 
-
-static LOGGER: Lazy<Mutex<Logger>> = Lazy::new(|| {
-    Mutex::new(Logger { file : None })
-});
-
-pub fn set_file(file_path: &str) {
-    LOGGER.lock().unwrap().set_file(file_path);
-}
-
-#[allow(dead_code)]
-pub fn debug<S: AsRef<str>>(message: S) {
-    LOGGER.lock().unwrap().log("debug", message.as_ref()).ok();
-}
-
-#[allow(dead_code)]
 pub fn info<S: AsRef<str>>(message: S) {
-    LOGGER.lock().unwrap().log("info", message.as_ref()).ok();
+    log("info", message.as_ref());
 }
 
-#[allow(dead_code)]
 pub fn warn<S: AsRef<str>>(message: S) {
-    LOGGER.lock().unwrap().log("warn", message.as_ref()).ok();
+    log("warn", message.as_ref());
 }
 
-#[allow(dead_code)]
 pub fn error<S: AsRef<str>>(message: S) {
-    LOGGER.lock().unwrap().log("error", message.as_ref()).ok();
+    log("error", message.as_ref());
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn logging_never_panics_with_or_without_a_file() {
+        set_file(std::path::Path::new(
+            "/nonexistent-directory-for-tests/nxm.log",
+        ));
+        info("hello");
+        warn("careful");
+        error("bad");
+    }
 }

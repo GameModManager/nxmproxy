@@ -1,20 +1,30 @@
 [package]
 name = "nxmproxy"
-version = "0.1.0"
-edition = "2018"
+version = "0.2.0"
+edition = "2021"
+rust-version = "1.74"
+description = "Cross-platform nxm:// link router. Forwards Nexus Mods links to the mod manager assigned for that game."
+license = "GPL-3.0-or-later"
+repository = "https://github.com/GameModManager/nxmproxy"
 
 [profile.release]
 codegen-units = 1
 lto = true
 opt-level = 'z'
+strip = true
 
 [dependencies]
-bindings = { path = "bindings" }
-once_cell = "*"
-structopt = "0.3"
-url = "2.2"
-directories = "3.0"
-serde = { version = "1.0", features = ["derive"] }
-toml = "0.5"
+clap = { version = "4", features = ["derive"] }
+directories = "5"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "0.8"
+url = "2"
 
 [dev-dependencies]
+serde_json = "1"
+
+# The upstream `bindings` crate is gone on purpose. It was a Windows binding
+# generator built on `windows` 0.17 whose build macro only emits code for
+# Windows targets, so `cargo check` died in bindings/build.rs on Linux and
+# macOS. See README "Divergences from upstream".

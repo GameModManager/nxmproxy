@@ -1,0 +1,71 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
+# Fork of https://github.com/TanninOne/nxmproxy - see NOTICE.md
+
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+  # Keep the build honest and self-contained.
+  CARGO_INCREMENTAL: "0"
+  RUSTFLAGS: "-D warnings"
+
+jobs:
+  test:
+    name: ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          rustup toolchain install stable --profile minimal --component rustfmt,clippy
+          rustup default stable
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+
+      - name: Clippy
+        run: cargo clippy --all-targets --all-features -- -D warnings
+
+      - name: Build
+        run: cargo build --release
+
+      # What this proves on macOS and Windows: the crate compiles there, and the
+      # pure logic and the platform module text are correct.
+      # What it does NOT prove: that lsregister makes macOS offer the bundle, or
+      # that reg.exe writes the keys we intend. Those need a real machine and a
+      # real click, and are called out as unverified in README.md.
+      - name: Test
+        run: cargo test --all-targets
+
+      - name: Test (release)
+        run: cargo test --release --all-targets
+
+      # The CLI contract a GUI depends on. Runs on all three platforms, and on
+      # Linux it is the test that proves registration never writes a default
+      # association.
+      - name: CLI smoke test
+        shell: bash
+        run: |
+          BIN="$(cargo build --release --message-format=json 2>/dev/null \
+                 | grep --line-buffered '"executable"' \
+                 | tail -1 | sed 's/.*"executable":"\([^"]*\)".*/\1/')"
+          echo "binary: $BIN"
+          "$BIN" --version
+          "$BIN" list
+          "$BIN" list --json | head -5
