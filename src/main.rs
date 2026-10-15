@@ -515,9 +515,21 @@ mod tests {
 
     #[test]
     fn a_bare_exec_resolves_only_when_it_is_really_there() {
-        // /bin/sh exists here; a made up name must not resolve. The GUI relies
-        // on this to flag a broken entry before a link fails silently.
-        assert!(resolve_exec("sh").is_some());
+        // A command that genuinely is on PATH on this platform, and one that
+        // is not, must give opposite answers. The GUI relies on this to flag a
+        // broken entry before a link fails silently.
+        // The name is platform specific: there is no `sh` on Windows and no
+        // `cmd` on unix, and the first CI run failed on both platforms for
+        // exactly that reason.
+        #[cfg(unix)]
+        let present = "sh";
+        #[cfg(windows)]
+        let present = "cmd";
+
+        assert!(
+            resolve_exec(present).is_some(),
+            "{present} should resolve on this platform"
+        );
         assert!(resolve_exec("nxmproxy-definitely-not-a-real-binary").is_none());
     }
 }

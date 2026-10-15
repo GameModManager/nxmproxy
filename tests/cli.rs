@@ -276,9 +276,19 @@ fn an_empty_config_with_one_manager_still_delivers() {
         "precondition: no config file"
     );
 
+    // The manager is this very binary invoked with a verb that exits
+    // immediately. Hardcoding /bin/true, as this test did, is wrong on macOS
+    // (where it lives at /usr/bin/true) and on Windows (where it does not
+    // exist); the first CI run failed on both.
     let registered = run(
         &sandbox,
-        &["register-manager", "only", "/bin/true", "--", "%1"],
+        &[
+            "register-manager",
+            "only",
+            env!("CARGO_BIN_EXE_nxmproxy"),
+            "--",
+            "list",
+        ],
     );
     assert_eq!(code(&registered), 0, "{}", stderr(&registered));
 
