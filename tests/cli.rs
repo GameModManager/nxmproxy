@@ -144,6 +144,31 @@ fn run(sandbox: &Sandbox, args: &[&str]) -> Output {
         .expect("could not run the nxmproxy binary")
 }
 
+/// Serialises every test that runs `install` or `uninstall`.
+///
+/// The sandbox isolates config and XDG by environment variable. It cannot
+/// isolate the two things registration actually touches: on Windows that is
+/// one real `HKCU` for the whole runner, and on macOS one real
+/// `~/Library/Application Support`. Cargo runs tests in parallel threads, so
+/// without this they write to each other and whichever finishes second reports
+/// state the first left behind. The first CI run failed exactly that way, with
+/// `test` returning 0 before anything had been installed.
+///
+/// The lock also establishes a clean slate: a previous test's `install` would
+/// otherwise leave a registration behind for the next one to trip over.
+static INSTALL_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// Take [`INSTALL_LOCK`] and undo any handler a previous test left behind.
+///
+/// The guard must be held for the whole test. Poisoning is recovered from rather
+/// than propagated: a panic in one test says nothing about whether the registry
+/// is in a known state, and refusing to run the rest would hide the real failure.
+fn install_sandbox(sandbox: &Sandbox) -> std::sync::MutexGuard<'static, ()> {
+    let guard = INSTALL_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let _ = run(sandbox, &["uninstall"]);
+    guard
+}
+
 /// Like [`run`], but with `xdg-mime` unreachable.
 ///
 /// This exists because it is a genuinely different code path. When `xdg-mime`
@@ -458,6 +483,7 @@ fn a_corrupt_config_degrades_to_empty_with_a_warning() {
 #[test]
 fn linux_install_claims_the_scheme_in_one_file_and_buries_nobody() {
     let sandbox = Sandbox::new("install-linux");
+    let _lock = install_sandbox(&sandbox);
 
     // Pre-seed every file the behaviour under test could touch, so that
     // "left alone" is a real claim about content rather than about a file that
@@ -589,6 +615,7 @@ fn linux_install_claims_the_scheme_in_one_file_and_buries_nobody() {
 #[test]
 fn the_fallback_claim_path_buries_nobody_either() {
     let sandbox = Sandbox::new("fallback");
+    let _lock = install_sandbox(&sandbox);
     std::fs::create_dir_all(sandbox.xdg_config_home()).unwrap();
     std::fs::create_dir_all(sandbox.data_applications()).unwrap();
 
@@ -657,6 +684,7 @@ fn the_fallback_claim_path_buries_nobody_either() {
 #[test]
 fn linux_uninstall_removes_only_our_line() {
     let sandbox = Sandbox::new("uninstall-linux");
+    let _lock = install_sandbox(&sandbox);
     std::fs::create_dir_all(sandbox.xdg_config_home()).unwrap();
 
     std::fs::write(
@@ -785,6 +813,7 @@ fn the_command_names_are_the_final_surface_and_the_old_ones_are_gone() {
 #[test]
 fn install_and_uninstall_round_trip() {
     let sandbox = Sandbox::new("round-trip");
+    let _lock = install_sandbox(&sandbox);
 
     let tested = run(&sandbox, &["test"]);
     assert_eq!(code(&tested), 1, "not installed means a non-zero exit code");
@@ -868,6 +897,7 @@ fn install_and_uninstall_round_trip() {
 #[test]
 fn install_registers_a_manager_it_can_prove_is_present() {
     let sandbox = Sandbox::new("detect");
+    let _lock = install_sandbox(&sandbox);
     let apps = sandbox.data_applications();
     std::fs::create_dir_all(&apps).unwrap();
 
@@ -935,6 +965,7 @@ fn install_registers_a_manager_it_can_prove_is_present() {
         format!("[Desktop Entry]\nExec=\"{}\" --quiet\n", bin_path()),
     )
     .unwrap();
+    let _ = run(&unusable, &["uninstall"]);
     let refused = run(&unusable, &["install"]);
     assert_eq!(
         code(&refused),
@@ -962,6 +993,7 @@ fn install_registers_a_manager_it_can_prove_is_present() {
         format!("[Desktop Entry]\nExec=\"{}\" --handle-nxm %u\n", bin_path()),
     )
     .unwrap();
+    let _ = run(&other, &["uninstall"]);
     let kept = run(&other, &["install"]);
     assert!(
         stdout(&kept).contains("Keeping the mod managers already"),

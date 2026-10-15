@@ -113,6 +113,32 @@ mod ffi {
     }
 }
 
+/// What to report, given what `LSSetDefaultHandlerForURLScheme` returned.
+///
+/// Split from the call itself for the same reason `windows.rs` separates
+/// building registry operations from running `reg.exe`: **a test must not make a
+/// real system call to assert a decision.** Calling `LSSetDefaultHandlerForURLScheme`
+/// from a unit test on a headless CI runner took the whole test binary down with
+/// SIGTRAP before a single test name printed. The decision is pure; the FFI is a
+/// three-line shell around it.
+pub fn decide_claim(status: i32) -> Result<Claim, String> {
+    if status != 0 {
+        return Err(format!(
+            "LaunchServices refused to assign {SCHEME}:// to {BUNDLE_ID} (OSStatus {status}). \
+             Set it by hand: Finder > Get Info on NXM Proxy.app > Open with > Change All."
+        ));
+    }
+    // Never `verified`. The call succeeded in *asking*, and nothing here can
+    // read the answer, so reporting success would be asserting something this
+    // program cannot know.
+    Ok(Claim::needs_user(
+        "macOS was asked to hand nxm:// to NXM Proxy and may ask you to confirm. \
+         If it did not, set it by hand: Finder > Get Info on NXM Proxy.app > Open with > \
+         NXM Proxy > Change All. nxmproxy cannot read the answer back, so it will not \
+         claim success.",
+    ))
+}
+
 /// Hand `nxm://` to our bundle.
 ///
 /// Returns a claim that is **never** `Claim::verified`: the API is one-way and
@@ -120,15 +146,13 @@ mod ffi {
 /// to make on macOS. The user-facing instruction is printed either way.
 ///
 /// Off macOS this returns the same honest refusal instead of panicking, so
-/// that the invariant above is testable from a Linux build. `platform::imp`
-/// never selects this module there; the branch exists for the tests.
+/// that the invariant is testable from a Linux build. `platform::imp` never
+/// selects this module there; the branch exists for the tests.
 pub fn claim() -> Result<Claim, String> {
     #[cfg(not(target_os = "macos"))]
     {
         let _ = (SCHEME, BUNDLE_ID);
-        Ok(Claim::needs_user(
-            "this build is not running on macOS, so no scheme was claimed",
-        ))
+        decide_claim(0)
     }
     #[cfg(target_os = "macos")]
     {
@@ -142,18 +166,7 @@ pub fn claim() -> Result<Claim, String> {
         logger::info(format!(
             "LSSetDefaultHandlerForURLScheme({SCHEME}) -> {status}"
         ));
-        if status != 0 {
-            return Err(format!(
-                "LaunchServices refused to assign {SCHEME}:// to {BUNDLE_ID} (OSStatus {status}). \
-                 Set it by hand: Finder > Get Info on NXM Proxy.app > Open with > Change All."
-            ));
-        }
-        Ok(Claim::needs_user(
-            "macOS was asked to hand nxm:// to NXM Proxy and may ask you to confirm. \
-             If it did not, set it by hand: Finder > Get Info on NXM Proxy.app > Open with > \
-             NXM Proxy > Change All. nxmproxy cannot read the answer back, so it will not \
-             claim success.",
-        ))
+        decide_claim(status)
     }
 }
 
@@ -370,11 +383,11 @@ mod tests {
         // NEEDS_USER split, and a green here would be a lie in the only place
         // anyone reads it.
         //
-        // Asserted against `claim`, not `unclaim`: `unclaim` was never capable
-        // of claiming anything, so testing it proves nothing about install.
-        // This now runs on Linux too, which is the only way a Linux build can
-        // see the invariant at all.
-        let claim = claim().expect("claim must not error");
+        // Asserted against `decide_claim`, which is the whole decision. Calling
+        // `claim()` itself here would make a real LaunchServices call, which
+        // took the macOS test binary down with SIGTRAP on a headless runner.
+        // OSStatus 0 is "the ask succeeded"; every other value is a refusal.
+        let claim = decide_claim(0).expect("a successful ask must not error");
         assert!(
             !claim.claimed,
             "macOS cannot be read back, so install must never report a verified claim"
@@ -382,11 +395,38 @@ mod tests {
         assert_eq!(
             claim.exit_code(),
             crate::platform::EXIT_NEEDS_USER,
-            "a script must be able to tell 'registered, one click left' from 'done'"
+            "a script must tell 'registered, one click left' from 'done'"
         );
         assert!(
             !claim.instruction.trim().is_empty(),
             "a claim that was not made must still say what to do by hand"
+        );
+
+        // A refusal is an error carrying the manual route, never a silent 0.
+        for status in [1, -54] {
+            let refused = decide_claim(status).unwrap_err();
+            assert!(
+                refused.contains("Change All"),
+                "OSStatus {status}: a refusal must say how to do it by hand: {refused}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_ffi_shell_is_thin_and_makes_no_decision_of_its_own() {
+        // The decision lives in `decide_claim` so it can be tested without
+        // LaunchServices. This guards the other half of that split: if someone
+        // adds a branch to `claim` that decides something, the split is gone.
+        let body = claim_fn_body();
+        for decision in ["Claim::verified", "Claim::needs_user", "exit_code"] {
+            assert!(
+                !body.contains(decision),
+                "`claim` must delegate its decision to `decide_claim`, but contains {decision}"
+            );
+        }
+        assert!(
+            body.contains("decide_claim(status)"),
+            "claim must hand the OSStatus to decide_claim:\n{body}"
         );
     }
 
