@@ -28,7 +28,7 @@ use route::Route;
 
 /// Bumped when the `list --json` shape changes, so a GUI can refuse a format
 /// it does not understand instead of misreading it.
-const LIST_SCHEMA_VERSION: u32 = 2;
+const LIST_SCHEMA_VERSION: u32 = 3;
 
 #[derive(Parser, Debug)]
 #[command(
@@ -84,6 +84,24 @@ enum Command {
 
     /// Report whether nxmproxy is registered, and who the OS says handles nxm://.
     Test,
+
+    /// Find every mod manager this machine declares, and remember them.
+    ///
+    /// An application is found because its own desktop entry says
+    /// `MimeType=x-scheme-handler/nxm` - the XDG declaration of "I take nxm
+    /// links", published by the application itself. HD2Arsenal is the case this
+    /// exists for: a third-party manager, absent from any list we ship.
+    ///
+    /// **Found is not chosen.** Every manager it stores is assigned to nothing,
+    /// and routes nothing, until you `assign` it. Silently routing a link into
+    /// an application you never picked is the one thing this program must not
+    /// do, so nothing is ever registered *and* routed in the same step.
+    ///
+    /// Safe to run as often as you like: it never changes a manager you
+    /// already have, never removes one whose application has been uninstalled
+    /// (it is marked unavailable instead), and never picks between candidates.
+    /// Run it again after installing a mod manager or a game.
+    Discover,
 
     /// Show the routing table. `--json` is the machine-readable contract.
     List {
@@ -219,6 +237,11 @@ struct JsonManager<'a> {
     takes_url: bool,
     /// False when the executable cannot be found on this machine.
     exec_exists: bool,
+    /// True when discovery found this manager on this machine and nobody
+    /// chose it. A GUI must present it as a suggestion, never as the one that
+    /// is set up: nxmproxy itself refuses to route to one of these until a
+    /// game is assigned to it.
+    discovered: bool,
 }
 
 #[derive(serde::Serialize)]
@@ -269,6 +292,12 @@ struct JsonList<'a> {
     /// Applications found by their own `x-scheme-handler/nxm` declaration that
     /// the curated list above could never contain, because we did not know they
     /// existed. HD2Arsenal is the case this exists for.
+    ///
+    /// This is a **live** scan of the desktop directories, independent of the
+    /// config: it reports what is there now, including managers `discover`
+    /// never stored because one already had that id. A GUI offers these for
+    /// one-click registration; a user who has already run `discover` reads
+    /// `managers[].discovered` instead.
     declared_managers: Vec<JsonDeclaredManager>,
     warnings: &'a [String],
 }
@@ -545,6 +574,7 @@ fn list_json(config: &Config, loaded: &config::Loaded, dir: &Path) -> String {
                 pipe: manager.pipe.as_deref(),
                 takes_url: manager.takes_url(),
                 exec_exists: resolve_exec(&manager.exec).is_some(),
+                discovered: config.discovered.contains(id),
             })
             .collect(),
         assignments: config
@@ -652,6 +682,7 @@ fn print_candidates(candidates: &[Candidate]) {
         println!("\nthen pick who owns which game:\n\n    nxmproxy assign <name> <game>");
         println!("or send every unassigned game to one of them:\n    nxmproxy assign <name> _");
     }
+    println!("\nor remember them all at once, assigned to nothing:\n    nxmproxy discover");
 
     print_refused(&refused);
 }
@@ -673,6 +704,93 @@ fn print_refused(refused: &[String]) {
     for line in refused {
         println!("  {line}");
     }
+}
+
+/// Remember every manager this machine declares, assigned to nothing.
+///
+/// Only [`declared_candidates`] feeds this - the applications whose **own**
+/// desktop entry declares `x-scheme-handler/nxm`. The curated list in
+/// [`defaults`] is deliberately left out: it is a list of guesses about
+/// executable names, and writing guesses into the user's database is the thing
+/// the declaration-based detection exists to avoid.
+///
+/// Both guards detection already applies are inherited by calling it rather than
+/// reimplementing it: a candidate whose executable does not resolve, or whose
+/// argv would receive no link, is never a candidate and is never stored.
+///
+/// Re-runnable by construction: [`Config::discover_manager`] refuses to touch an
+/// id that is already known, so running this twice, or after a `register` or an
+/// `assign`, changes nothing that was already there.
+fn discover_managers(config: &mut Config) -> Vec<String> {
+    let mut added = Vec::new();
+    for candidate in declared_candidates() {
+        // The "already known" decision lives in `Config::discover_manager` and
+        // nowhere else. A second copy of it here was written first, and a
+        // mutation of that copy left the suite green - which is what a
+        // duplicated guard buys.
+        match config.discover_manager(&candidate.id, candidate.manager.clone()) {
+            Ok(true) => added.push(format!("{} ({})", candidate.name, candidate.id)),
+            Ok(false) => {}
+            // A refused registration is reported, never swallowed: it means a
+            // candidate exists that we could not store, and silence would make
+            // the count of found managers and the count of stored managers
+            // disagree with no explanation.
+            Err(message) => {
+                eprintln!("nxmproxy: could not remember {}: {message}", candidate.name)
+            }
+        }
+    }
+    added
+}
+
+/// Compose `discover`: remember what is on this machine, choose nothing.
+fn handle_discover(config: &mut Config, save: &dyn Fn(&Config) -> i32) -> i32 {
+    let found = declared_candidates();
+    if found.is_empty() {
+        println!(
+            "No mod manager on this machine declares x-scheme-handler/nxm, so there is nothing \
+             to remember.\nAdd one by hand:  nxmproxy register <name> <exec> [<args>...]"
+        );
+        print_refused(&unusable_declarations());
+        return 0;
+    }
+
+    let added = discover_managers(config);
+    let code = save(config);
+    if code != 0 {
+        return code;
+    }
+
+    if added.is_empty() {
+        println!(
+            "{} mod manager{} on this machine {} already known. Nothing changed.",
+            found.len(),
+            if found.len() == 1 { "" } else { "s" },
+            if found.len() == 1 { "is" } else { "are" }
+        );
+    } else {
+        println!(
+            "Found {} mod manager{}:",
+            found.len(),
+            if found.len() == 1 { "" } else { "s" }
+        );
+        for line in &added {
+            println!("  {line}");
+        }
+
+        // The whole point of the feature, stated plainly rather than left for
+        // the user to discover by clicking a link that goes nowhere. Only when
+        // something was actually remembered: saying "remembered" after adding
+        // nothing is a sentence that is simply false.
+        println!("\nRemembered, but assigned to no game. Nothing routes until you say so:");
+        println!("    nxmproxy assign <name> <game>");
+        println!("or send every game with no assignment to one of them:");
+        println!("    nxmproxy assign <name> _");
+        println!("\n`nxmproxy list` shows what was found and what you have chosen.");
+    }
+
+    print_refused(&unusable_declarations());
+    0
 }
 
 /// Where the per-user executable directory is, and what it is for.
@@ -709,6 +827,22 @@ fn print_local_bin() {
     );
 }
 
+/// The games assigned to `id`, as the `list` table shows them.
+fn games_of(config: &Config, id: &str) -> Vec<String> {
+    config
+        .games
+        .iter()
+        .filter(|(_, assigned)| assigned.as_str() == id)
+        .map(|(domain, _)| {
+            if domain == config::CATCH_ALL {
+                "_ (every unassigned game)".to_string()
+            } else {
+                domain.clone()
+            }
+        })
+        .collect()
+}
+
 fn print_list(config: &Config, loaded: &config::Loaded, dir: &Path) {
     println!("config: {}", dir.join(config::CONFIG_FILE).display());
     for warning in &loaded.warnings {
@@ -724,34 +858,62 @@ fn print_list(config: &Config, loaded: &config::Loaded, dir: &Path) {
 
     println!("\nmod managers:");
     for (id, manager) in &config.managers {
-        let mut notes: Vec<String> = Vec::new();
+        let discovered = config.discovered.contains(id);
+        let mut notes: Vec<String> = vec![if discovered {
+            "discovered - you have not chosen this one".to_string()
+        } else {
+            "registered by you".to_string()
+        }];
+
+        let games = games_of(config, id);
+        notes.push(if games.is_empty() {
+            "no games assigned".to_string()
+        } else {
+            format!("games: {}", games.join(", "))
+        });
+
         if !manager.takes_url() {
             notes.push("no %1, %u or %U in its arguments, it would receive no link".to_string());
         }
         if resolve_exec(&manager.exec).is_none() {
-            notes.push("executable not found on this machine".to_string());
+            // Kept, not deleted. A file going missing is the commonest way a
+            // list silently loses an entry, and the user would have to find and
+            // retype the whole thing.
+            notes.push(format!(
+                "unavailable: {:?} is not on this machine, it was uninstalled",
+                manager.exec
+            ));
         }
         if let Some(pipe) = &manager.pipe {
             notes.push(format!("pipe {pipe}"));
         }
-        let suffix = if notes.is_empty() {
-            String::new()
-        } else {
-            format!("  ({})", notes.join("; "))
-        };
         println!(
-            "  {id}: {} {}{suffix}",
+            "  {id}: {} {}\n      ({})",
             manager.exec,
-            manager.args.join(" ")
+            manager.args.join(" "),
+            notes.join("; ")
+        );
+    }
+
+    if !config.discovered.is_empty() {
+        println!(
+            "\n  a discovered manager routes nothing until a game is assigned to it. \
+             `nxmproxy list` never picks one for you."
         );
     }
 
     println!("\ngames:");
-    if config.games.is_empty() && config.managers.len() > 1 {
-        println!("  none - with more than one manager every game needs an assignment,");
-        println!("  otherwise there is no correct answer and guessing would misroute the link");
-    } else if config.games.is_empty() {
-        println!("  none - every game goes to the only registered manager");
+    if config.games.is_empty() {
+        let chosen = config
+            .managers
+            .iter()
+            .filter(|(id, _)| !config.discovered.contains(*id))
+            .count();
+        if chosen == 1 {
+            println!("  none - every game goes to the only mod manager you registered");
+        } else {
+            println!("  none - no game is routed to anything, because no game has been assigned");
+        }
     } else {
         for (domain, manager) in &config.games {
             let label = if domain == config::CATCH_ALL {
@@ -980,6 +1142,8 @@ fn run() -> i32 {
         Command::Uninstall => handle_uninstall(),
 
         Command::Test => handle_test(),
+
+        Command::Discover => handle_discover(&mut config, &save),
 
         Command::List { json } => {
             if json {

@@ -26,8 +26,14 @@
 //! args = []
 //! pipe = "vortex_download"
 //! ```
+//!
+//! A third difference from upstream: a manager can be **remembered without being
+//! chosen**. `discovered` names the ids that were found on this machine by
+//! `nxmproxy discover` rather than typed by the user. They are present and
+//! usable, and they route nothing until an `assign` says so - see
+//! [`crate::route::resolve`].
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -116,6 +122,20 @@ pub struct Config {
     /// Manager id -> manager.
     #[serde(default)]
     pub managers: BTreeMap<String, Manager>,
+    /// Manager ids that discovery found on this machine and the user did not
+    /// choose.
+    ///
+    /// This is the difference between *knowing* a manager exists and *having
+    /// picked* it. `register` never adds to it and only `discover` does, so it
+    /// cannot be reached by accident, and [`crate::route::resolve`] never lets
+    /// one of these own a game by default. It is a set of ids rather than a
+    /// flag on [`Manager`] so that one new field cannot break the struct
+    /// literal every existing call site writes.
+    ///
+    /// Omitted from the file when empty, so a user who never runs `discover`
+    /// sees no trace of it.
+    #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
+    pub discovered: BTreeSet<String>,
 }
 
 /// Outcome of loading the config file.
@@ -228,6 +248,12 @@ impl Config {
             ok
         });
 
+        // A manager that did not survive validation is not remembered as
+        // discovered either. A stale id here would be harmless today and would
+        // silently downgrade a manager the user later registers by hand into
+        // one that routes nothing.
+        self.discovered.retain(|id| self.managers.contains_key(id));
+
         warnings
     }
 
@@ -257,6 +283,11 @@ impl Config {
         if manager.exec.trim().is_empty() {
             return Err("a mod manager needs a non-empty executable".to_string());
         }
+        // Registering by hand is the user choosing. A manager that discovery
+        // found and the user then registered is no longer merely found, and
+        // leaving it flagged would keep it out of routing for ever - found on a
+        // machine where the user had already answered the question by hand.
+        self.discovered.remove(id);
         let mut manager = manager;
         if let Some(existing) = self.managers.get(id) {
             manager.pipe = manager.pipe.or_else(|| existing.pipe.clone());
@@ -272,7 +303,32 @@ impl Config {
         if self.managers.remove(id).is_none() {
             return Ok(false);
         }
+        self.discovered.remove(id);
         self.games.retain(|_, assigned| assigned != id);
+        Ok(true)
+    }
+
+    /// Remember a manager discovery found, **assigned to nothing**.
+    ///
+    /// Two rules, and both of them exist because the alternative is a user
+    /// losing something:
+    ///
+    /// * **Never clobber.** An id that is already known is left exactly as it
+    ///   is, including its `discovered` flag, its pipe and its assignments. A
+    ///   re-scan is therefore safe to run at any time, and running it cannot
+    ///   undo a `register` or an `assign`.
+    /// * **Never remove anything.** A manager whose application was uninstalled
+    ///   stays here and is reported unavailable by `list`; forgetting it
+    ///   because a file went missing is how a list silently loses entries, and
+    ///   the user would have to find and retype the whole thing.
+    ///
+    /// Returns whether anything was added.
+    pub fn discover_manager(&mut self, id: &str, manager: Manager) -> Result<bool, String> {
+        if self.managers.contains_key(id) {
+            return Ok(false);
+        }
+        self.register_manager(id, manager)?;
+        self.discovered.insert(id.to_string());
         Ok(true)
     }
 
@@ -577,6 +633,73 @@ solved = "ghost"
         assert!(
             err.contains("register"),
             "message must be actionable: {err}"
+        );
+    }
+
+    #[test]
+    fn a_discovered_manager_is_remembered_without_being_chosen() {
+        let mut cfg = Config::default();
+        assert!(cfg
+            .discover_manager(
+                "hd2arsenal",
+                Manager {
+                    exec: "/a".into(),
+                    args: vec!["%1".into()],
+                    pipe: None
+                }
+            )
+            .unwrap());
+        assert!(cfg.discovered.contains("hd2arsenal"));
+        assert!(
+            cfg.games.is_empty(),
+            "discovering a manager is not assigning it: {:?}",
+            cfg.games
+        );
+
+        // Already known, by any route: nothing is touched, so `discover` is
+        // safe to run again after a `register` or an `assign`.
+        assert!(!cfg
+            .discover_manager(
+                "hd2arsenal",
+                Manager {
+                    exec: "/different".into(),
+                    args: vec![],
+                    pipe: None
+                }
+            )
+            .unwrap());
+        assert_eq!(cfg.managers["hd2arsenal"].exec, "/a");
+    }
+
+    /// A manager that did not survive validation must not stay in `discovered`.
+    /// A stale id there is silent: the user re-registers the manager by hand
+    /// under the same name, and it routes nothing, with nothing saying why.
+    #[test]
+    fn a_stale_discovered_id_is_dropped_on_load() {
+        let dir = tmp("stale-discovered");
+        // `discovered` must come **before** any table header. Written after one
+        // it becomes a key of that table, is ignored as unknown, and the
+        // assertion below passes against an empty set that was never populated -
+        // which is exactly what happened the first time this was written.
+        fs::write(
+            dir.join(CONFIG_FILE),
+            "discovered = [\"ghost\"]\n\n[managers.real]\nexec = \"/bin/true\"\n",
+        )
+        .unwrap();
+        let loaded = Config::load(&dir);
+        assert!(
+            loaded.warnings.is_empty(),
+            "the fixture must be a valid config, not an unreadable one: {:?}",
+            loaded.warnings
+        );
+        assert!(
+            loaded.config.managers.contains_key("real"),
+            "precondition: a real manager was loaded"
+        );
+        assert!(
+            loaded.config.discovered.is_empty(),
+            "an id with no manager survived: {:?}",
+            loaded.config.discovered
         );
     }
 

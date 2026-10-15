@@ -73,6 +73,12 @@ Every item here is a deliberate change, with the reason.
   third-party manager works without being added to this project. Before this,
   the only thing auto-detection could do was look for *our own* entry filename.
   See "Finding the mod manager".
+* **`discover`: a manager can be known without being chosen.** Upstream's
+  `register` was the only way a manager got into the database, so the user had
+  to type the whole command before the list showed anything. A desktop entry
+  that declares nxm handling is stored as a **known, unassigned** manager
+  instead, and routes nothing until an `assign` says so. See "Remembering a
+  mod manager without choosing it".
 * **Tests and CI.** Upstream had no tests at all.
 * **A release pipeline** producing one static Linux binary, the licence and the
   checksum. See "The Linux binary".
@@ -387,6 +393,61 @@ something we would spawn, because the argv still comes from `[Desktop Entry]`.
 `Categories=` is deliberately **not** used. HD2Arsenal ships `Categories=Utility;`,
 the same as a text editor, so category matching would have taken a calculator.
 
+### Remembering a mod manager without choosing it
+
+Detection above is **transient**: it prints candidates and the user types
+`register`. `discover` is the other half - it puts what it found into the
+database, so the manager is there, usable, and waiting.
+
+```sh
+nxmproxy discover          # remember every manager this machine declares
+nxmproxy assign hd2arsenal helldivers2   # and now route this game to it
+```
+
+**Found is not chosen.** A discovered manager is stored with **no assignment** -
+not the game, not the `_` catch-all - and it routes nothing. That is the entire
+point of storing it separately, and it is why routing rule 3 counts only ids
+the user registered: a remembered manager that won rule 3 by default would be
+the exact failure this tool exists to prevent, arriving through the one rule
+that was written to be safe for a user who had nothing configured. `list` says
+which is which, and a GUI reads `managers[].discovered`.
+
+**Where it runs, and why not in `install`.** It is a separate command, and
+`install` only *points* at it:
+
+* `install` already has a documented rule - it never extends a configuration it
+  did not create - and a second, hidden write path inside `install` is exactly
+  how that rule gets lost. A user who runs `install` to claim a scheme should
+  not silently acquire a database full of suggestions.
+* `install` is the command a wrapper script and a package post-install hook
+  call. A database write that nobody asked for is much worse in that context
+  than in one a person typed.
+* It is therefore **re-runnable on demand**, which is what users need anyway:
+  games and mod managers get installed after setup, and a one-shot scan at
+  install time has nothing to say about them.
+
+It is safe to run as often as you like:
+
+* **It never clobbers.** An id already known is left exactly as it is, flag,
+  pipe and assignments included. A scan cannot undo a `register` or an `assign`.
+* **It never removes anything.** A manager whose application has been
+  uninstalled stays in the database and `list` marks it `unavailable: ... it was
+  uninstalled`. Forgetting an entry because a file went missing is how a list
+  silently loses rows, and the user would have to find and retype the whole
+  thing.
+* **Registering one by hand clears its `discovered` flag.** Having answered the
+  question by hand is the answer; leaving the flag would keep a manager the user
+  chose out of routing for ever.
+* **Every guard detection has still applies.** An entry whose executable does
+  not resolve is named and refused, never stored broken. And remembering *every*
+  candidate does not resolve an ambiguity between them - two remembered managers
+  are two unassigned managers, and the link still stops.
+
+`discover` reads **only** the declaration source, never the curated list. The
+curated list is a set of guesses about executable names; writing guesses into
+the user's database is precisely what declaration-based detection exists to
+avoid.
+
 ### What a refusal looks like
 
 Two managers is the common case once detection works, because the whole point is
@@ -441,6 +502,7 @@ by declaration.
 | `register <name> <exec> [<args>...]` | Add a mod manager. |
 | `unregister <name>` | Remove a mod manager, and its game assignments. |
 | `assign <manager> <domain>` | Routing. `<domain>` is the `nexusmods.com` subdomain, or `_` for every game with no assignment. |
+| `discover` | Find every mod manager this machine declares and **remember** them, assigned to nothing. Re-runnable. |
 | `list [--json]` | The routing table. `--json` is the machine-readable contract. |
 | `test` | Report whether nxmproxy is registered and who the OS says handles `nxm://`. Exit 0 if registered, 1 if not. |
 | `pipe <manager> <pipe>` | Give a manager a named pipe to try before spawning it. |
@@ -522,13 +584,23 @@ The same code also covers "no mod manager to forward to", because typing
 
 1. An exact assignment for the domain.
 2. The `_` catch-all.
-3. **The only registered manager**, if there is exactly one.
+3. **The only manager the user chose**, if there is exactly one.
 
 Rule 3 is why an empty configuration works out of the box: a user with one mod
 manager needs nothing configured. It deliberately does **not** fire when two or
 more managers are registered. With two, there is no obvious owner, and a wrong
 guess is a link landing in someone else's mod queue, so nxmproxy says so and
 exits non-zero rather than guessing.
+
+**"Chose" means registered by hand.** A manager that `discover` found is
+registered too, and rule 3 deliberately does not count it: it counts only ids
+that are **not** in `discovered`. Letting a remembered manager win by default
+would be the same misroute arriving through the back door, wearing a shortcut
+that reads as "nothing is configured, so anything goes". With only discovered
+managers configured, nxmproxy refuses and says which it knows and what to type
+(`Route::Unassigned`) rather than guessing. An `assign` does route a discovered
+manager - that is a user typing a command, and it is the whole point of
+remembering one.
 
 ---
 
@@ -539,7 +611,7 @@ order). Unknown keys are ignored by readers.
 
 ```json
 {
-  "version": 2,
+  "version": 3,
   "config_path": "/home/u/.config/nxmproxy/config.toml",
   "config_writable": true,
   "managers": [
@@ -549,7 +621,8 @@ order). Unknown keys are ignored by readers.
       "args": ["%1"],
       "pipe": null,
       "takes_url": true,
-      "exec_exists": true
+      "exec_exists": true,
+      "discovered": false
     }
   ],
   "assignments": [
@@ -584,12 +657,13 @@ order). Unknown keys are ignored by readers.
 
 | Field | Why it is there |
 | --- | --- |
-| `version` | A GUI must be able to refuse a shape it does not understand instead of misreading it. **2** added `declared_managers`; a reader that only knows 1 should refuse rather than ignore the new managers and present a GUI that cannot register HD2Arsenal. |
+| `version` | A GUI must be able to refuse a shape it does not understand instead of misreading it. **2** added `declared_managers`; a reader that only knows 1 should refuse rather than ignore the new managers and present a GUI that cannot register HD2Arsenal. **3** added `managers[].discovered`; a reader that only knows 2 must refuse rather than present a manager the user never chose as one that is set up. |
+| `managers[].discovered` | `true` when `discover` found this manager on this machine and nobody has chosen it. **Found is not chosen**: nxmproxy itself refuses to route to one of these until a game is assigned to it. A GUI must present it as a suggestion, never as the manager that is already handling links. |
 | `config_writable` | `false` when the file exists but does not parse. A GUI must **not** offer to save in that state, because saving would overwrite the file the user still needs to repair. |
 | `managers[].takes_url` | `false` when no element of `args` contains `%1`, i.e. the manager would be launched and handed nothing. A GUI can show this before the user clicks a link. |
 | `managers[].exec_exists` | Whether the executable is actually present on this machine, so a GUI can flag a broken entry instead of letting the user discover it when a link silently fails. |
 | `known_managers` | The curated list, so a GUI need not hardcode it. **Data only, never registered.** Each entry carries a `note` saying what is and is not verified about it. |
-| `declared_managers` | Applications found by their **own** `x-scheme-handler/nxm` declaration. Not in `known_managers` because we cannot have known about them in advance - that is the whole point. **Data only, never registered.** Each entry carries the `entry` it was read from, so a GUI can say where it found it rather than presenting a command as magic. |
+| `declared_managers` | Applications found by their **own** `x-scheme-handler/nxm` declaration. Not in `known_managers` because we cannot have known about them in advance - that is the whole point. **A live scan of the desktop directories, independent of the config**: it reports what is there now, including managers `discover` already stored under that id, and `list` does not store anything. Each entry carries the `entry` it was read from, so a GUI can say where it found it rather than presenting a command as magic. |
 | `warnings` | Anything dropped while loading, so the user is not left guessing. |
 
 The shape resembles GameModManager's `gmm.supported-games/1` only in that both
@@ -621,6 +695,8 @@ only place the reason can live is there.
 ### Format
 
 ```toml
+discovered = ["hd2arsenal"]   # found by `discover`, not chosen by you
+
 [games]
 skyrimse = "vortex"
 _ = "vortex"          # catch-all for every game with no assignment
@@ -630,6 +706,13 @@ exec = "/opt/vortex/Vortex"   # a path, or a bare name resolved through PATH
 args = ["%1"]                 # the link goes here
 pipe = "vortex_download"      # optional, Windows only
 ```
+
+`discovered` is a list of manager ids that `discover` found and the user has not
+registered by hand. **It is written before any table header** - TOML would read
+it as a key of the next table instead, ignore it as unknown, and silently drop
+the provenance. It is omitted entirely when empty, so a user who never runs
+`discover` sees no trace of it, and a stale id whose manager failed validation
+is dropped on load.
 
 **Writes are atomic**: temp file plus rename. A concurrent reader sees either the
 old file or the new one, never a half-written one.
@@ -762,6 +845,18 @@ red. The controls are mutation-and-observe, not assertion-counting:
 | 14 | `%u` and `%U` are dropped from the field codes, leaving `%1` alone | `the_desktop_entry_spellings_of_the_field_code_all_substitute`, `a_manager_registered_from_a_desktop_entry_receives_the_link` |
 | 15 | substitution re-scans the text it just wrote, so a URL containing `%u` is substituted into a second time | `substitution_is_one_pass_so_a_url_containing_a_field_code_survives` |
 | 16 | `--` before the argument vector is made mandatory again | `a_manager_registered_from_a_desktop_entry_receives_the_link` |
+| 17 | a discovered manager counts toward rule 3, so it wins by default | `a_remembered_manager_never_routes_a_link_the_user_did_not_ask_for`, `a_discovered_manager_never_owns_a_game_until_it_is_assigned` |
+| 18 | the `Ambiguous` list offers a manager the user never chose | `a_discovered_manager_is_never_one_of_the_choices_offered` |
+| 19 | `discover_manager` overwrites an id that is already known | `a_rescan_does_not_clobber_a_registered_manager_or_an_assignment`, `a_discovered_manager_is_remembered_without_being_chosen` |
+| 20 | `register` no longer clears the `discovered` flag | `registering_a_discovered_manager_by_hand_makes_it_a_choice` |
+| 21 | load keeps a `discovered` id whose manager failed validation | `a_stale_discovered_id_is_dropped_on_load` |
+| 22 | `list` reverts to "executable not found on this machine" | `an_uninstalled_application_is_marked_unavailable_and_not_forgotten` |
+| 23 | `list` stops printing where each manager came from | `list_tells_discovered_registered_and_assigned_apart` |
+| 24 | `install` runs discovery itself | `install_never_writes_a_discovered_manager_on_its_own` |
+| 25 | `discover` also assigns the catch-all to what it found | `discover_remembers_the_real_arsenal_entry_and_assigns_it_nothing`, `a_remembered_manager_never_routes_a_link_the_user_did_not_ask_for` |
+| 26 | `declared_candidates` accepts an `Exec` that does not resolve | `discover_keeps_every_candidate_and_stores_nothing_it_can_be_start` |
+| 27 | a re-scan claims "remembered" when it remembered nothing | `a_rescan_does_not_clobber_a_registered_manager_or_an_assignment` |
+| 28 | the Arsenal fixture is tidied - the duplicate scheme, or the `MimeType` moved into `[Desktop Entry]` | `the_arsenal_fixture_is_still_the_file_a_user_has` |
 
 One control is deliberately reported as **green**, and that is the point of
 running them at all. Breaking `Claim::exit_code` to always return 0 did **not**
@@ -773,6 +868,22 @@ and the two `uninstall` tests, which assert `needs_user` with no routing guard t
 back them up. That is defence in depth working, and it is also a reminder that a
 control only proves what the test it targets actually asserts - control 6 above
 exists for the exit code itself.
+
+A second control came back green and had to be redesigned rather than reported.
+Control 18 changes what the `Ambiguous` branch puts in its list, and the test
+written for it - "a discovered manager does not make a single chosen manager
+ambiguous" - **never reached that branch at all**. With one manager the user
+chose, `resolve` returns from the `chosen.len() == 1` arm and builds no list
+whatsoever, so the mutated line did not execute and the suite was right to stay
+green. The test name promised a property its body could not observe.
+
+That is the second time in this project a control has been green on the first
+attempt, and it is the same failure both times: a test that asserts the
+*outcome* of a decision without ever reaching the decision. The test now builds
+**two** configurations - one chosen manager plus one discovered (which does
+return early, and which is caught by control 17), and two chosen plus one
+discovered (which does reach the list, and fails with
+`["hd2arsenal", "mo2", "vortex"]` against `["mo2", "vortex"]`).
 
 The rest found real bugs while they were being written:
 
@@ -797,7 +908,7 @@ The rest found real bugs while they were being written:
 
 `unclaim` does its own per-id filtering to decide which other managers survive on
 the `[Default Applications]` line, and **that filter has no test**. Breaking it
-so it keeps nothing leaves all 87 tests green, because the `uninstall` fixtures
+so it keeps nothing leaves all 119 tests green, because the `uninstall` fixtures
 never put a second manager on the same `[Default Applications]` nxm key - the
 shared-key case is only exercised one level down, against `set_default_ids`
 directly, which is not the code path `unclaim` uses. Reaching it needs a

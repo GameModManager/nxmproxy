@@ -1243,27 +1243,7 @@ fn a_third_party_manager_that_declares_nxm_handling_is_found_and_routes() {
         "precondition: nothing declares nxm yet"
     );
 
-    std::fs::write(
-        apps.join("hd2arsenal.desktop"),
-        format!(
-            "[Desktop Entry]\n\
-             Name=HD2Arsenal\n\
-             Exec=\"{recorder}\" --no-sandbox %U\n\
-             Type=Application\n\
-             Icon=hd2arsenal\n\
-             StartupWMClass=HD2Arsenal\n\
-             X-AppImage-Version=0.36.2\n\
-             Categories=Utility;\n\
-             Actions=Uninstall;\n\
-             \n\
-             [Desktop Action Uninstall]\n\
-             Name=Move to Trash\n\
-             Exec=\"{recorder}\" uninstall %U\n\
-             Icon=user-trash\n\
-             MimeType=x-scheme-handler/rsnl;x-scheme-handler/nxm;application/x-hd2a-project;x-scheme-handler/nxm;\n"
-        ),
-    )
-    .unwrap();
+    std::fs::write(apps.join("hd2arsenal.desktop"), arsenal_fixture(&recorder)).unwrap();
 
     // `declared_managers` is how a GUI learns about this without running
     // install, so the discovery is asserted through the same call twice: once
@@ -1543,7 +1523,7 @@ fn list_json_is_machine_readable_and_declares_its_version() {
         .unwrap_or_else(|e| panic!("list --json must be valid JSON: {e}\n{}", stdout(&listed)));
 
     assert_eq!(
-        json["version"], 2,
+        json["version"], 3,
         "a GUI needs a version to refuse politely"
     );
     for key in [
@@ -1563,6 +1543,10 @@ fn list_json_is_machine_readable_and_declares_its_version() {
     assert_eq!(manager["exec"], "/opt/vortex/vortex");
     assert_eq!(manager["args"][0], "%1");
     assert_eq!(manager["takes_url"], true);
+    // Hand-registered, not discovered. The flag is the whole difference between
+    // "the manager you have" and "one nxmproxy found", and a GUI must be able
+    // to tell them apart.
+    assert_eq!(manager["discovered"], false);
     // /opt/vortex/vortex does not exist here, and the contract says so rather
     // than letting a GUI discover a broken entry when a link silently fails.
     assert_eq!(manager["exec_exists"], false);
@@ -1597,7 +1581,7 @@ fn list_json_on_a_bare_machine_is_still_valid() {
     let listed = run(&sandbox, &["list", "--json"]);
     assert_eq!(code(&listed), 0, "{}", stderr(&listed));
     let json: serde_json::Value = serde_json::from_str(&stdout(&listed)).unwrap();
-    assert_eq!(json["version"], 2);
+    assert_eq!(json["version"], 3);
     assert_eq!(json["config_writable"], true);
     assert_eq!(json["managers"].as_array().unwrap().len(), 0);
     assert_eq!(json["assignments"].as_array().unwrap().len(), 0);
@@ -1628,6 +1612,622 @@ fn malformed_input_is_rejected_cleanly() {
         );
         assert!(!stderr(&out).is_empty(), "{bad:?} got no explanation");
     }
+}
+
+// ---------------------------------------------------------------------------
+// `discover`: remembering a manager without choosing it.
+//
+// The rule every test here defends: **found is not chosen**. Persistence is the
+// feature; auto-routing would be a bug wearing the feature's clothes.
+// ---------------------------------------------------------------------------
+
+/// The real HD2Arsenal 0.36.2 entry, verbatim.
+///
+/// Only the `Exec=` paths are swapped, because `/home/petrica/Applications` does
+/// not exist in a sandbox. **Everything else is untouched**, and
+/// [`the_arsenal_fixture_is_still_the_file_a_user_has`] asserts that: the quoted
+/// `Exec=`, `Categories=Utility;`, the `MimeType` in the **wrong group**, the
+/// duplicated `x-scheme-handler/nxm`, and an action group carrying its own
+/// `Exec=`.
+fn arsenal_fixture(recorder: &str) -> String {
+    format!(
+        "[Desktop Entry]\n\
+         Name=HD2Arsenal\n\
+         Exec=\"{recorder}\" --no-sandbox %U\n\
+         Type=Application\n\
+         Icon=hd2arsenal\n\
+         StartupWMClass=HD2Arsenal\n\
+         X-AppImage-Version=0.36.2\n\
+         Comment=Helldivers 2 Companion Desktop Application, Mod Manager, Mod Manifest Builder, Lobby Browser, and more!\n\
+         Categories=Utility;\n\
+         Actions=Uninstall;\n\
+         \n\
+         [Desktop Action Uninstall]\n\
+         Name=Move to Trash\n\
+         Exec={recorder} uninstall \"/home/petrica/Applications/HD2Arsenal\"\n\
+         Icon=user-trash\n\
+         MimeType=x-scheme-handler/rsnl;x-scheme-handler/nxm;application/x-hd2a-project;x-scheme-handler/nxm;\n"
+    )
+}
+
+/// A fixture that has been tidied is a fixture nobody has.
+///
+/// This is the control on every other test in this file that uses
+/// [`arsenal_fixture`]: if someone "cleans up" the fixture, the four defects
+/// that make it a real file go with it, and this test goes red rather than the
+/// suite quietly testing a tidier, easier, and much less realistic entry.
+#[test]
+fn the_arsenal_fixture_is_still_the_file_a_user_has() {
+    let fixture = arsenal_fixture("/opt/HD2Arsenal");
+    let entry = fixture.split("[Desktop Action Uninstall]").next().unwrap();
+    let action = fixture.split("[Desktop Action Uninstall]").nth(1).unwrap();
+
+    // 1. The `Exec=` path is quoted. Splitting on whitespace leaves the quotes
+    //    attached and the file does not exist.
+    assert!(entry.contains(r#"Exec="/opt/HD2Arsenal" --no-sandbox %U"#));
+    // 2. The category is the one a text editor would carry, so category
+    //    matching would take this file, a text editor, and a calculator.
+    assert!(entry.contains("Categories=Utility;"));
+    // 3. `x-scheme-handler/nxm` is NOT under `[Desktop Entry]` at all, only
+    //    under the action group. A strict group-reader does not see Arsenal.
+    assert!(!entry.contains("MimeType="));
+    assert!(action.contains("x-scheme-handler/nxm"));
+    // 4. It is listed twice in that one value. One scheme declared twice is
+    //    one handler.
+    assert_eq!(
+        action.matches("x-scheme-handler/nxm").count(),
+        2,
+        "the duplicated scheme is the bug; tidying it away removes the test"
+    );
+    // 5. And the action group's `Exec=` is an *uninstall*, which is what makes
+    //    a group-blind parser dangerous rather than merely wrong.
+    assert!(action.contains(" uninstall "));
+    assert!(!action.contains("AppManager"));
+}
+
+/// The feature: a manager nxmproxy found is in the config, usable, and assigned
+/// to nothing.
+#[cfg(target_os = "linux")]
+#[test]
+fn discover_remembers_the_real_arsenal_entry_and_assigns_it_nothing() {
+    let sandbox = Sandbox::new("discover-arsenal");
+    let apps = sandbox.data_applications();
+    std::fs::create_dir_all(&apps).unwrap();
+    let (recorder, _) = argv_recorder(&sandbox, "My Applications/HD2Arsenal");
+    assert!(recorder.contains(' '), "precondition: a space in the path");
+
+    // Nothing stored before the command is run: discovery is a command the user
+    // runs, not a side effect of `list`.
+    let before = run(&sandbox, &["list", "--json"]);
+    let json: serde_json::Value = serde_json::from_str(&stdout(&before)).unwrap();
+    assert_eq!(
+        json["managers"].as_array().unwrap().len(),
+        0,
+        "precondition: an empty database"
+    );
+
+    std::fs::write(apps.join("HD2Arsenal.desktop"), arsenal_fixture(&recorder)).unwrap();
+    let found = run(&sandbox, &["discover"]);
+    assert_eq!(code(&found), 0, "{}{}", stdout(&found), stderr(&found));
+    assert!(
+        stdout(&found).contains("HD2Arsenal"),
+        "the manager it remembered must be named:\n{}",
+        stdout(&found)
+    );
+
+    // Persisted, with the argv that actually receives the link.
+    let config = std::fs::read_to_string(sandbox.config_file()).unwrap_or_default();
+    assert!(
+        config.contains("[managers.hd2arsenal]"),
+        "it was not stored:\n{config}"
+    );
+    assert!(
+        config.contains(&recorder) && config.contains("--no-sandbox") && config.contains("%1"),
+        "stored with the wrong invocation; a quoted Exec keeps its quotes or a \
+         group-blind reader picks the uninstall action:\n{config}"
+    );
+    assert!(
+        config.contains("discovered"),
+        "the file must say which managers were found rather than chosen:\n{config}"
+    );
+
+    // **Assigned to nothing.** Not one game, not even the catch-all.
+    let listed = run(&sandbox, &["list", "--json"]);
+    let json: serde_json::Value = serde_json::from_str(&stdout(&listed)).unwrap();
+    assert_eq!(
+        json["assignments"].as_array().unwrap().len(),
+        0,
+        "discovery auto-assigned a game: {json}"
+    );
+    assert_eq!(json["managers"][0]["discovered"], true);
+    assert_eq!(json["managers"][0]["id"], "hd2arsenal");
+}
+
+/// THE control on the feature. Every remembered manager routes nothing until a
+/// game is assigned to it.
+///
+/// The mutation this defends against is subtle and was the reason it is a test:
+/// rule 3 of `resolve` says "with exactly one manager registered, every game
+/// routes to it", which is what makes an out-of-the-box install work. A
+/// remembered manager *is* registered. Without the exclusion, discovering
+/// Arsenal on a fresh machine auto-routes every nxm link on the box into it -
+/// through the one rule written to be safe when the user had exactly one
+/// manager and nothing to choose between.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_remembered_manager_never_routes_a_link_the_user_did_not_ask_for() {
+    let sandbox = Sandbox::new("discover-no-route");
+    let apps = sandbox.data_applications();
+    std::fs::create_dir_all(&apps).unwrap();
+    let (recorder, argv_file) = argv_recorder(&sandbox, "My Applications/HD2Arsenal");
+    std::fs::write(apps.join("HD2Arsenal.desktop"), arsenal_fixture(&recorder)).unwrap();
+
+    assert_eq!(code(&run(&sandbox, &["discover"])), 0);
+
+    let link = "nxm://helldivers2/mods/1/files/2";
+    let routed = run(&sandbox, &["url", link]);
+    assert_eq!(
+        code(&routed),
+        1,
+        "a discovered manager was auto-assigned: {}{}",
+        stdout(&routed),
+        stderr(&routed)
+    );
+    assert!(panic_markers(&routed).is_empty(), "{}", stderr(&routed));
+    // Named, with the command that makes it live.
+    assert!(
+        stderr(&routed).contains("nxmproxy assign"),
+        "the refusal must say what to do next:\n{}",
+        stderr(&routed)
+    );
+    assert!(
+        stderr(&routed).contains("hd2arsenal"),
+        "the refusal must name what it knows:\n{}",
+        stderr(&routed)
+    );
+    // The decisive one: the process was never started. A green exit code alone
+    // would not catch a manager that was spawned and handed nothing.
+    assert!(
+        !argv_file.exists(),
+        "the manager was started for a game nobody assigned to it: {}",
+        std::fs::read_to_string(&argv_file).unwrap_or_default()
+    );
+
+    // And it becomes live the moment the user asks for it, which is what makes
+    // remembering it worth anything.
+    assert_eq!(
+        code(&run(&sandbox, &["assign", "hd2arsenal", "helldivers2"])),
+        0
+    );
+    let now = run(&sandbox, &["url", link]);
+    assert_eq!(code(&now), 0, "{}{}", stdout(&now), stderr(&now));
+    assert!(
+        wait_for(&argv_file, "DONE", Duration::from_secs(10)),
+        "an assigned manager must run: {}",
+        std::fs::read_to_string(&argv_file).unwrap_or_default()
+    );
+}
+
+/// Re-running must not undo anything the user has done since. A scan that
+/// overwrites an entry is worse than no scan: the user types a command, runs
+/// the thing that is supposed to be harmless, and their work is gone.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_rescan_does_not_clobber_a_registered_manager_or_an_assignment() {
+    let sandbox = Sandbox::new("discover-rescan");
+    let apps = sandbox.data_applications();
+    std::fs::create_dir_all(&apps).unwrap();
+    let (recorder, _) = argv_recorder(&sandbox, "My Applications/HD2Arsenal");
+    std::fs::write(apps.join("HD2Arsenal.desktop"), arsenal_fixture(&recorder)).unwrap();
+
+    // The user registered it by hand, with a different invocation, and gave it
+    // a game. Both are theirs. The hand-registered exec is a **real file**: a
+    // manager that cannot be spawned would fail the routing assertion below for
+    // a reason that has nothing to do with discovery.
+    let (mine, _) = argv_recorder(&sandbox, "opt/Mine Manager");
+    assert_eq!(
+        code(&run(
+            &sandbox,
+            &["register", "hd2arsenal", &mine, "--", "--flags", "%1"]
+        )),
+        0
+    );
+    assert_eq!(
+        code(&run(&sandbox, &["assign", "hd2arsenal", "helldivers2"])),
+        0
+    );
+
+    let again = run(&sandbox, &["discover"]);
+    assert_eq!(code(&again), 0, "{}{}", stdout(&again), stderr(&again));
+
+    let config = std::fs::read_to_string(sandbox.config_file()).unwrap_or_default();
+    assert!(
+        config.contains(&mine),
+        "the rescan overwrote the manager the user registered:\n{config}"
+    );
+    assert!(
+        !config.contains(&recorder),
+        "the rescan replaced the user's invocation with the one it found on disk:\n{config}"
+    );
+    assert!(
+        !config.contains("discovered"),
+        "the rescan relabelled a manager the user chose as one nxmproxy found:\n{config}"
+    );
+    assert!(
+        config.contains("helldivers2"),
+        "the rescan dropped the assignment:\n{config}"
+    );
+
+    // The same fact through the contract a GUI reads, so a formatter change
+    // cannot quietly make the TOML assertion above vacuous.
+    let json: serde_json::Value =
+        serde_json::from_str(&stdout(&run(&sandbox, &["list", "--json"]))).unwrap();
+    assert_eq!(
+        json["managers"][0]["discovered"], false,
+        "the rescan demoted a manager the user chose to a suggestion: {json}"
+    );
+
+    // And it is still a manager the user chose, so it still routes everything
+    // the catch-all would: discovery did not demote it into "suggestion".
+    assert_eq!(
+        code(&run(&sandbox, &["url", "nxm://skyrimse/mods/1"])),
+        0,
+        "a re-scan turned a working manager into one that routes nothing"
+    );
+
+    // Nothing to add the second time, and saying so is the honest report.
+    assert!(
+        stdout(&again).contains("already known"),
+        "a rescan must not claim to have added what was already there:\n{}",
+        stdout(&again)
+    );
+}
+
+/// A manager whose application has been uninstalled is **remembered and marked**,
+/// not deleted. The desktop entry goes first and the binary second, so both
+/// happen in practice.
+#[cfg(target_os = "linux")]
+#[test]
+fn an_uninstalled_application_is_marked_unavailable_and_not_forgotten() {
+    let sandbox = Sandbox::new("discover-gone");
+    let apps = sandbox.data_applications();
+    std::fs::create_dir_all(&apps).unwrap();
+    let (recorder, _) = argv_recorder(&sandbox, "My Applications/HD2Arsenal");
+    let (other, _) = argv_recorder(&sandbox, "apps/Mod Two");
+    std::fs::write(apps.join("HD2Arsenal.desktop"), arsenal_fixture(&recorder)).unwrap();
+    std::fs::write(
+        apps.join("two.desktop"),
+        format!(
+            "[Desktop Entry]\nName=Mod Two\nExec=\"{other}\" %U\nMimeType=x-scheme-handler/nxm;\n"
+        ),
+    )
+    .unwrap();
+    assert_eq!(code(&run(&sandbox, &["discover"])), 0);
+    let stored = std::fs::read_to_string(sandbox.config_file()).unwrap_or_default();
+    assert!(
+        stored.contains("[managers.hd2arsenal]") && stored.contains("[managers.mod-two]"),
+        "precondition: both were remembered:\n{stored}"
+    );
+
+    // The application is uninstalled: the entry first, as a package manager
+    // would do it, then the binary. **One of two**, deliberately - with only one
+    // manager on the machine, `discover` finds nothing at all and returns before
+    // it touches the database, so the case that can actually lose the entry is
+    // the one where something else survived the scan.
+    std::fs::remove_file(apps.join("HD2Arsenal.desktop")).unwrap();
+    std::fs::remove_file(std::path::Path::new(&recorder)).unwrap();
+
+    let again = run(&sandbox, &["discover"]);
+    assert_eq!(code(&again), 0, "{}{}", stdout(&again), stderr(&again));
+
+    let config = std::fs::read_to_string(sandbox.config_file()).unwrap_or_default();
+    assert!(
+        config.contains("[managers.hd2arsenal]"),
+        "a missing file deleted a remembered manager; the user would have to find \
+         and retype the whole thing:\n{config}"
+    );
+    assert!(
+        config.contains("[managers.mod-two]"),
+        "the manager that is still installed did not survive either:\n{config}"
+    );
+
+    let listed = run(&sandbox, &["list"]);
+    let out = stdout(&listed);
+    assert!(
+        out.contains("hd2arsenal"),
+        "it vanished from the listing:\n{out}"
+    );
+    assert!(
+        out.contains("unavailable") && out.contains("uninstalled"),
+        "the listing must say what happened, not just drop it:\n{out}"
+    );
+    assert!(
+        out.contains("discovered"),
+        "and it must still read as found, not chosen:\n{out}"
+    );
+    assert!(
+        !out.contains(&format!("unavailable: {other}")),
+        "the manager that is still installed was marked unavailable:\n{out}"
+    );
+
+    // The JSON contract agrees with the table, which is the disagreement that
+    // makes a diagnostic useless.
+    let json: serde_json::Value =
+        serde_json::from_str(&stdout(&run(&sandbox, &["list", "--json"]))).unwrap();
+    let by_id = |id: &str| -> serde_json::Value {
+        json["managers"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|m| m["id"] == id)
+            .cloned()
+            .unwrap_or_else(|| panic!("{id} is missing from {json}"))
+    };
+    assert_eq!(by_id("hd2arsenal")["exec_exists"], false);
+    assert_eq!(by_id("hd2arsenal")["discovered"], true);
+    assert_eq!(by_id("mod-two")["exec_exists"], true);
+}
+
+/// Registering by hand after a scan is a choice, and it must stick.
+///
+/// Found on the live machine while writing this: `discover` stored HD2Arsenal,
+/// the user then ran `register` on the same id, and `list` still called it
+/// "discovered - you have not chosen this one". The registration had answered
+/// the question and the answer was discarded.
+///
+/// The fix is one line in `register_manager`, but a test has to hold it there,
+/// and the order is the whole point: **discover then register**, not the other
+/// way round.
+#[cfg(target_os = "linux")]
+#[test]
+fn registering_a_discovered_manager_by_hand_makes_it_a_choice() {
+    let sandbox = Sandbox::new("discover-then-register");
+    let apps = sandbox.data_applications();
+    std::fs::create_dir_all(&apps).unwrap();
+    let (recorder, _) = argv_recorder(&sandbox, "My Applications/HD2Arsenal");
+    std::fs::write(apps.join("HD2Arsenal.desktop"), arsenal_fixture(&recorder)).unwrap();
+
+    assert_eq!(code(&run(&sandbox, &["discover"])), 0);
+    let scanned: serde_json::Value =
+        serde_json::from_str(&stdout(&run(&sandbox, &["list", "--json"]))).unwrap();
+    assert_eq!(scanned["managers"][0]["discovered"], true, "precondition");
+
+    // The user takes it over.
+    let (mine, _) = argv_recorder(&sandbox, "opt/Mine Manager");
+    assert_eq!(
+        code(&run(
+            &sandbox,
+            &["register", "hd2arsenal", &mine, "--", "%1"]
+        )),
+        0
+    );
+
+    let after: serde_json::Value =
+        serde_json::from_str(&stdout(&run(&sandbox, &["list", "--json"]))).unwrap();
+    assert_eq!(
+        after["managers"][0]["discovered"], false,
+        "registering by hand did not make it a choice: {after}"
+    );
+
+    // And a later scan cannot put the label back, which is the whole point of
+    // the rescan test running the other way round.
+    assert_eq!(code(&run(&sandbox, &["discover"])), 0);
+    let rescan: serde_json::Value =
+        serde_json::from_str(&stdout(&run(&sandbox, &["list", "--json"]))).unwrap();
+    assert_eq!(
+        rescan["managers"][0]["discovered"], false,
+        "the rescan relabelled a manager the user had chosen: {rescan}"
+    );
+    assert!(
+        !stdout(&run(&sandbox, &["list"])).contains("you have not chosen this one"),
+        "the table still calls it unchosen"
+    );
+}
+
+/// `list` is how a user tells what nxmproxy found from what they chose, so it
+/// has to say which is which and who is routed where.
+#[cfg(target_os = "linux")]
+#[test]
+fn list_tells_discovered_registered_and_assigned_apart() {
+    let sandbox = Sandbox::new("discover-list");
+    let apps = sandbox.data_applications();
+    std::fs::create_dir_all(&apps).unwrap();
+    let (recorder, _) = argv_recorder(&sandbox, "My Applications/HD2Arsenal");
+    std::fs::write(apps.join("HD2Arsenal.desktop"), arsenal_fixture(&recorder)).unwrap();
+
+    // One the user registered and assigned. One nxmproxy found. One nxmproxy
+    // found and the user then assigned - both, not either.
+    assert_eq!(
+        code(&run(
+            &sandbox,
+            &["register", "vortex", "/opt/vortex/Vortex", "--", "%1"]
+        )),
+        0
+    );
+    assert_eq!(code(&run(&sandbox, &["discover"])), 0);
+    assert_eq!(code(&run(&sandbox, &["assign", "vortex", "skyrimse"])), 0);
+    assert_eq!(
+        code(&run(
+            &sandbox,
+            &["register", "mo2", "/opt/mo2/MO2Launcher", "--", "%1"]
+        )),
+        0
+    );
+    assert_eq!(
+        code(&run(&sandbox, &["assign", "hd2arsenal", "helldivers2"])),
+        0
+    );
+
+    let out = stdout(&run(&sandbox, &["list"]));
+    assert!(out.contains("skyrimse -> vortex"), "{out}");
+    assert!(out.contains("helldivers2 -> hd2arsenal"), "{out}");
+
+    // Provenance, per manager. A GUI reads the JSON for this, and the table has
+    // to agree with it.
+    let json: serde_json::Value =
+        serde_json::from_str(&stdout(&run(&sandbox, &["list", "--json"]))).unwrap();
+    let by_id = |id: &str| -> serde_json::Value {
+        json["managers"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|m| m["id"] == id)
+            .cloned()
+            .unwrap_or_else(|| panic!("{id} is missing from {json}"))
+    };
+    assert_eq!(by_id("hd2arsenal")["discovered"], true);
+    assert_eq!(by_id("vortex")["discovered"], false);
+    assert_eq!(by_id("mo2")["discovered"], false);
+    assert!(
+        out.contains("discovered - you have not chosen this one"),
+        "the table must say which managers were found:\n{out}"
+    );
+    assert!(
+        out.contains("registered by you"),
+        "and which were chosen:\n{out}"
+    );
+    // Usage, per manager: the games that reach it.
+    assert!(out.contains("games: helldivers2"), "{out}");
+    assert!(out.contains("no games assigned"), "{out}");
+}
+
+/// The guards detection already has, inherited rather than reimplemented.
+///
+/// Ambiguity is not resolved by discovery either - it does not choose, it
+/// remembers, and remembering both is not choosing. An entry that resolves to
+/// nothing is still refused rather than stored broken.
+#[cfg(target_os = "linux")]
+#[test]
+fn discover_keeps_every_candidate_and_stores_nothing_it_cannot_start() {
+    let sandbox = Sandbox::new("discover-guards");
+    let apps = sandbox.data_applications();
+    std::fs::create_dir_all(&apps).unwrap();
+    let (one, _) = argv_recorder(&sandbox, "apps/Mod One");
+    let (two, _) = argv_recorder(&sandbox, "apps/Mod Two");
+    for (file, name, exec) in [
+        ("one.desktop", "Mod One", &one),
+        ("two.desktop", "Mod Two", &two),
+    ] {
+        std::fs::write(
+            apps.join(file),
+            format!(
+                "[Desktop Entry]\nName={name}\nExec=\"{exec}\" %U\nMimeType=x-scheme-handler/nxm;\n"
+            ),
+        )
+        .unwrap();
+    }
+
+    // Neither is chosen, so neither routes.
+    assert_eq!(code(&run(&sandbox, &["discover"])), 0);
+    let listed = run(&sandbox, &["list", "--json"]);
+    let json: serde_json::Value = serde_json::from_str(&stdout(&listed)).unwrap();
+    let ids: Vec<&str> = json["managers"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|m| m["id"].as_str().unwrap())
+        .collect();
+    assert_eq!(ids, vec!["mod-one", "mod-two"], "{json}");
+    assert_eq!(
+        json["assignments"].as_array().unwrap().len(),
+        0,
+        "ambiguity was resolved by discovery: {json}"
+    );
+
+    let refused = run(&sandbox, &["url", "nxm://skyrimse/mods/1"]);
+    assert_eq!(
+        code(&refused),
+        1,
+        "{}{}",
+        stdout(&refused),
+        stderr(&refused)
+    );
+    assert!(
+        stderr(&refused).contains("mod-one") && stderr(&refused).contains("mod-two"),
+        "both candidates must be named:\n{}",
+        stderr(&refused)
+    );
+
+    // And the third refusal: an entry that resolves to nothing is named and
+    // stored nowhere, not stored broken.
+    let ghost = sandbox.root.join("not-installed").join("Ghost");
+    std::fs::write(
+        apps.join("ghost.desktop"),
+        format!(
+            "[Desktop Entry]\nName=Ghost Manager\nExec={} %U\nMimeType=x-scheme-handler/nxm;\n",
+            ghost.display()
+        ),
+    )
+    .unwrap();
+    let out = run(&sandbox, &["discover"]);
+    assert_eq!(code(&out), 0, "{}{}", stdout(&out), stderr(&out));
+    let json: serde_json::Value =
+        serde_json::from_str(&stdout(&run(&sandbox, &["list", "--json"]))).unwrap();
+    assert!(
+        !json["managers"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|m| m["id"] == "ghost-manager"),
+        "a manager that cannot be started was stored: {json}"
+    );
+    assert!(
+        stdout(&out).contains("Ghost Manager") && stdout(&out).contains("not on this machine"),
+        "and it must be named with the reason:\n{}",
+        stdout(&out)
+    );
+}
+
+/// `install` must not discover behind the user's back. It already has a
+/// documented rule - it never extends a configuration it did not create - and
+/// a second, hidden write path is exactly how that rule gets lost.
+#[cfg(target_os = "linux")]
+#[test]
+fn install_never_writes_a_discovered_manager_on_its_own() {
+    let sandbox = Sandbox::new("install-no-discover");
+    let _lock = install_sandbox(&sandbox);
+    let apps = sandbox.data_applications();
+    std::fs::create_dir_all(&apps).unwrap();
+
+    // Two managers, so `install` reaches the point where it lists candidates.
+    // One would be auto-registered by `install`'s own pre-existing rule, which
+    // is a different code path and is asserted by
+    // `install_registers_a_manager_it_can_prove_is_present`.
+    let (one, _) = argv_recorder(&sandbox, "apps/Mod One");
+    let (two, _) = argv_recorder(&sandbox, "apps/Mod Two");
+    for (file, name, exec) in [
+        ("one.desktop", "Mod One", &one),
+        ("two.desktop", "Mod Two", &two),
+    ] {
+        std::fs::write(
+            apps.join(file),
+            format!(
+                "[Desktop Entry]\nName={name}\nExec=\"{exec}\" %U\nMimeType=x-scheme-handler/nxm;\n"
+            ),
+        )
+        .unwrap();
+    }
+
+    let installed = run(&sandbox, &["install"]);
+    assert!(
+        stdout(&installed).contains("nxmproxy discover"),
+        "install must point at the command that stores them, not run it: {}",
+        stdout(&installed)
+    );
+    assert!(
+        !sandbox.config_file().exists(),
+        "install wrote a discovered manager behind the user's back: {}",
+        std::fs::read_to_string(sandbox.config_file()).unwrap_or_default()
+    );
+
+    // And the command it points at works straight afterwards.
+    let found = run(&sandbox, &["discover"]);
+    assert_eq!(code(&found), 0, "{}{}", stdout(&found), stderr(&found));
+    let config = std::fs::read_to_string(sandbox.config_file()).unwrap_or_default();
+    assert!(
+        config.contains("[managers.mod-one]") && config.contains("[managers.mod-two]"),
+        "discover after install did not store them:\n{config}"
+    );
 }
 
 /// The design property everything rests on: the OS launches us per uri and we
