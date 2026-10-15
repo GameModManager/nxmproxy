@@ -197,6 +197,26 @@ install that routed nothing.
 > takes the claim when the user agrees, and what `test` reports on a machine
 > where something else already owns `nxm://`. Because the call cannot be read
 > back, `install` **never** reports a verified claim on macOS and always exits 3.
+>
+> **CI found the API is not merely unverified - it is hostile.** On the headless
+> `macos-latest` runner, `LSSetDefaultHandlerForURLScheme` **aborts the process**
+> (killed by a signal, not an error return). LaunchServices needs a GUI session
+> that a CI runner does not have, and the first CI run proved it: two integration
+> tests that run the real binary died, and a unit test that called the API
+> directly took the whole test binary down with SIGTRAP.
+>
+> Two consequences, both permanent and neither hidden:
+>
+> * The unit tests target `decide_claim(status)`, a pure function of the
+>   `OSStatus`, so the suite makes **no** system call. The FFI is a three-line
+>   shell around it. This is the same split `windows.rs` already uses to keep
+>   `reg.exe` out of the tests.
+> * The two integration tests that run the real `install` accept a process
+>   killed by a signal as "needs user", never as success, and print a note when
+>   it happens. So **the macOS install path is not covered end to end**, and this
+>   README does not claim it is. The assertion those tests still carry on macOS
+>   is the one that matters most: nxmproxy never reports a claim it cannot
+>   verify.
 
 `nxmproxy test` cannot report the current default handler without
 `LSCopyDefaultHandlerForURLScheme`, which this fork does not bind, so `test`
@@ -518,10 +538,24 @@ Every CLI test runs in a throwaway config directory and a throwaway
 > it verifies the CLI contract and the exit codes rather than the OS
 > integration. Those need a real machine and a real click.
 >
-> This split is not hypothetical. The first CI run failed on both: the Windows
-> named-pipe path was missing its `io::Write` import, which no Linux build can
-> see because the function is `#[cfg(windows)]`, and would have failed to compile
-> for every Windows user.
+> This split is not hypothetical. The **first CI run of the claiming work failed
+> on all three platforms**, and every failure was one a Linux build could not
+> see:
+>
+> * macOS: the unit tests made a real LaunchServices call and the binary died
+>   with SIGTRAP before printing a test name.
+> * macOS: two integration tests died because the real binary aborts on a
+>   headless runner.
+> * Windows: tests that run `install` share one real `HKCU` and the sandbox
+>   cannot isolate it, so cargo's parallel threads overwrote each other and `test`
+>   reported registered before anything had been installed.
+> * Linux: the argv-recording test waited for a file to *exist* rather than to be
+>   finished, so on a loaded runner it read a half-written argv and reported a
+>   link that had lost its URL. It had been green locally for months.
+>
+> An earlier run failed the same way: the Windows named-pipe path was missing its
+> `io::Write` import, which no Linux build can see because the function is
+> `#[cfg(windows)]`, and would have failed to compile for every Windows user.
 
 ### Negative controls
 
