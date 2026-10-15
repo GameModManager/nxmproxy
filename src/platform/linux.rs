@@ -38,12 +38,20 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use crate::logger;
-use crate::platform::Claim;
+use crate::platform::{Claim, Declaration, Resolution};
 
 const SCHEME: &str = "nxm";
 const DESKTOP_FILE: &str = "nxmproxy.desktop";
 const MIME_TYPE: &str = "x-scheme-handler/nxm";
 const GROUP: &str = "Default Applications";
+
+/// "This app handles nxm." The application's own record of itself.
+const SECTION_ADDED: &str = "Added Associations";
+
+/// The id this platform registers nxmproxy under, which is what a
+/// `mimeapps.list` names when nxmproxy is the handler. See
+/// [`crate::platform::Status`] for why `test` needs to compare it.
+pub const OWN_ID: &str = DESKTOP_FILE;
 
 /// Quote one argument for the `Exec=` key of a desktop entry.
 ///
@@ -171,15 +179,25 @@ pub fn claim() -> Result<Claim, String> {
     // Only report success if the file now says so. `xdg-mime` exits 0 when it
     // wrote the line, but the effective handler is a property of the whole
     // mimeapps chain, so read it back rather than trusting the exit code.
-    let handler = current_handler()?;
-    let claim = if handler.as_deref() == Some(DESKTOP_FILE) {
+    //
+    // Read back through [`resolve`] and judged by [`owns`], the same two steps
+    // `test` and `list` take. Comparing the joined value against `DESKTOP_FILE`
+    // instead - which is what this used to do - reports a *failed* claim on a
+    // file that says `nxmproxy.desktop;vortex.desktop`, because nxmproxy is
+    // first in that list and is therefore the handler. A claim refused over a
+    // fallback we ourselves appended is the false negative of the false green
+    // this module exists to end.
+    let resolution = resolve();
+    let claim = if owns(&resolution) {
         Claim::verified()
     } else {
         Claim::needs_user(format!(
-            "{DESKTOP_FILE} is registered, but {} still says {:?} handles {MIME_TYPE}. \
+            "{DESKTOP_FILE} is registered, but {} still says {} handles {MIME_TYPE}. \
              Open Settings > Applications > Default Applications and pick NXM Proxy there.",
             mimeapps_path()?.display(),
-            handler.unwrap_or_else(|| "(nothing)".to_string())
+            resolution
+                .handler()
+                .unwrap_or_else(|| "(nothing)".to_string())
         ))
     };
 
@@ -231,18 +249,21 @@ pub fn mimeapps_path() -> Result<PathBuf, String> {
     }
 }
 
-/// The desktop file ids listed for `key` under `[Default Applications]`.
-pub fn default_ids(text: &str, key: &str) -> Option<Vec<String>> {
-    const GROUP_LOWER: &str = "default applications";
+/// The desktop file ids listed for `key` under one group of a `mimeapps.list`.
+///
+/// The group is matched case-insensitively and the **last** matching line wins
+/// inside it, because a file that repeats a key has been edited twice and the
+/// later statement is the current one. Both halves are things a real file does.
+pub fn group_ids(text: &str, group: &str, key: &str) -> Option<Vec<String>> {
     let mut section = String::new();
     let mut found = None;
     for line in text.lines() {
         let line = line.trim();
         if line.starts_with('[') {
-            section = line.trim_matches(['[', ']']).trim().to_ascii_lowercase();
+            section = line.trim_matches(['[', ']']).trim().to_string();
             continue;
         }
-        if section != GROUP_LOWER {
+        if !section.eq_ignore_ascii_case(group) {
             continue;
         }
         let Some((name, value)) = line.split_once('=') else {
@@ -262,6 +283,36 @@ pub fn default_ids(text: &str, key: &str) -> Option<Vec<String>> {
         }
     }
     found
+}
+
+/// The ids listed for `key` under `[Default Applications]`.
+pub fn default_ids(text: &str, key: &str) -> Option<Vec<String>> {
+    group_ids(text, GROUP, key)
+}
+
+/// Every place **this one file** says who handles `key`, in precedence order.
+///
+/// Both groups, not just `[Default Applications]`. Reading only the default
+/// group never produced a wrong winner, but it made a file that declares two
+/// different applications look like one that declares one - which is the state a
+/// user cannot resolve by hand. It also missed the desktop's own fallback: when
+/// no `[Default Applications]` entry names a type, the desktop uses
+/// `[Added Associations]`, so a machine with only an added association does open
+/// that application and this used to report that nobody claimed it.
+///
+/// The key is the **MIME type**, not the bare scheme: a `mimeapps.list` is keyed
+/// by MIME type, so `nxm=...` is a different key from `x-scheme-handler/nxm=...`
+/// and never matches what `xdg-mime default` wrote.
+pub fn associations(text: &str, key: &str) -> Vec<(&'static str, Vec<String>)> {
+    let mut out = Vec::new();
+    for section in [GROUP, SECTION_ADDED] {
+        // A group that exists with nothing in it is not a claim, and one that
+        // says `key=;` claims nothing either.
+        if let Some(ids) = group_ids(text, section, key).filter(|ids| !ids.is_empty()) {
+            out.push((section, ids));
+        }
+    }
+    out
 }
 
 /// Set or remove one `[Default Applications]` key. Pure: the text in, the text
@@ -388,18 +439,23 @@ pub fn is_registered() -> Result<bool, String> {
 }
 
 /// The effective default handler, read from the `mimeapps.list` chain.
+pub fn current_handler() -> Result<Option<String>, String> {
+    Ok(resolve().handler())
+}
+
+/// Every file the desktop may read a `mimeapps.list` from, in precedence order.
 ///
-/// The specification's lookup order is the user's config first, then the
-/// config dirs, then the data dirs, and **the first file that names a handler
-/// wins**: an entry in `~/.config/mimeapps.list` overrides one in
+/// The specification's lookup order is the user's config first, then the config
+/// dirs, then the data dirs, and **the first file that names a handler wins**:
+/// an entry in `~/.config/mimeapps.list` overrides one in
 /// `/usr/share/applications/mimeapps.list`. That is the whole reason writing to
 /// one file is enough to claim a scheme.
 ///
-/// This used to take the *last* hit instead, which is what a tool that writes
-/// to three files at once wants and a tool that writes to one does not: a
+/// This used to take the *last* hit instead, which is what a tool that writes to
+/// three files at once wants and a tool that writes to one does not: a
 /// system-wide entry for another manager would have made `test` - and the
 /// install verification - report a handler that the desktop does not use.
-pub fn current_handler() -> Result<Option<String>, String> {
+pub fn mimeapps_files() -> Vec<PathBuf> {
     let mut files: Vec<PathBuf> = Vec::new();
     if let Some(config_home) = std::env::var_os("XDG_CONFIG_HOME")
         .map(PathBuf::from)
@@ -430,24 +486,76 @@ pub fn current_handler() -> Result<Option<String>, String> {
     {
         files.push(dir.join("applications").join("mimeapps.list"));
     }
-
-    let texts: Vec<String> = files
-        .iter()
-        .filter_map(|file| std::fs::read_to_string(file).ok())
-        .collect();
-    Ok(effective_handler(&texts).map(|list| list.join(";")))
+    files
 }
 
-/// The first file that names a handler decides, per the specification's
-/// precedence. Pure, so the ordering rule is testable without a filesystem.
+/// Read the machine's answer: every place the desktop was told, and who won.
 ///
-/// The key is the **MIME type**, not the bare scheme. A `mimeapps.list` is
-/// keyed by MIME type, so `nxm=...` is a different key from
-/// `x-scheme-handler/nxm=...` and never matches what `xdg-mime default` wrote.
-/// Getting this wrong makes a successful install verify against a key nothing
-/// ever sets, and report "not the handler" straight after claiming the scheme.
-pub fn effective_handler(texts: &[String]) -> Option<Vec<String>> {
-    texts.iter().find_map(|text| default_ids(text, MIME_TYPE))
+/// The only impure part of the ordering. [`chain`] holds the rule and is
+/// exercised without touching a filesystem.
+pub fn resolve() -> Resolution {
+    let files: Vec<(PathBuf, String)> = mimeapps_files()
+        .into_iter()
+        .filter_map(|file| std::fs::read_to_string(&file).ok().map(|text| (file, text)))
+        .collect();
+    chain(&files)
+}
+
+/// Rank the declarations and say why the winner won. Pure.
+///
+/// `files` arrives in precedence order and each file's declarations arrive in
+/// [`associations`] order, so the first one is the answer and no search over
+/// the rest is ever performed - not even for our own name.
+pub fn chain(files: &[(PathBuf, String)]) -> Resolution {
+    let declarations: Vec<Declaration> = files
+        .iter()
+        .flat_map(|(path, text)| {
+            associations(text, MIME_TYPE)
+                .into_iter()
+                .map(move |(section, ids)| Declaration {
+                    source: path.display().to_string(),
+                    section: section.to_string(),
+                    ids,
+                })
+        })
+        .collect();
+    let rule = explain(&declarations);
+    Resolution {
+        declarations,
+        rule,
+        // The chain was read, so an empty one means nothing claims the scheme -
+        // which is a statement, not an absence of knowledge.
+        readable: true,
+    }
+}
+
+/// Why the winner won, in the specification's own terms.
+///
+/// The rule is always one of these four and never a guess, because the whole
+/// purpose of this type is that a user can check the answer against the file by
+/// hand. A resolution that cannot explain itself is the thing this replaced.
+fn explain(declarations: &[Declaration]) -> String {
+    let Some(first) = declarations.first() else {
+        return format!("no file on this machine declares {MIME_TYPE}");
+    };
+    if declarations.len() == 1 {
+        return "the only declaration on this machine".to_string();
+    }
+    // A `[Added Associations]` entry sitting below a `[Default Applications]`
+    // one is the case that made this necessary: the file looks like a conflict
+    // and the rule that settles it is a single sentence.
+    if first.section == GROUP && declarations.iter().any(|d| d.section != GROUP) {
+        return format!("[{GROUP}] outranks [{SECTION_ADDED}]");
+    }
+    "the first file that names the scheme decides".to_string()
+}
+
+/// True when nxmproxy is the application the desktop would open.
+///
+/// Same comparison on every OS that names applications by id. Pure given a
+/// [`Resolution`], so the rule is testable without one too.
+pub fn owns(resolution: &Resolution) -> bool {
+    resolution.first_id() == Some(OWN_ID)
 }
 
 #[cfg(test)]
@@ -521,23 +629,224 @@ x-scheme-handler/nxm=other.desktop;
         // one file only can still be beaten by a system-wide file under the
         // wrong rule, which is how a claim gets reported as successful when the
         // desktop would open something else.
-        let mine = format!("[Default Applications]\n{MIME_TYPE}={DESKTOP_FILE};");
-        let system = "[Default Applications]\nx-scheme-handler/nxm=vortex.desktop;";
+        let mine = (
+            PathBuf::from("/home/u/.config/mimeapps.list"),
+            format!("[Default Applications]\n{MIME_TYPE}={DESKTOP_FILE};"),
+        );
+        let system = (
+            PathBuf::from("/etc/xdg/mimeapps.list"),
+            "[Default Applications]\nx-scheme-handler/nxm=vortex.desktop;".to_string(),
+        );
+        let winner = |files: Vec<(PathBuf, String)>| {
+            chain(&files)
+                .winner()
+                .map(|w| w.ids.clone())
+                .unwrap_or_default()
+        };
         assert_eq!(
-            effective_handler(&[mine.clone(), system.to_string()]).as_deref(),
-            Some(&[DESKTOP_FILE.to_string()][..]),
+            winner(vec![mine.clone(), system.clone()]),
+            vec![DESKTOP_FILE.to_string()],
             "the first file that names a handler decides"
         );
         assert_eq!(
-            effective_handler(&[system.to_string(), mine.clone()]).as_deref(),
-            Some(&["vortex.desktop".to_string()][..]),
+            winner(vec![system.clone(), mine.clone()]),
+            vec!["vortex.desktop".to_string()],
             "and it is the ORDER that decides: a system-wide file listed first wins, \
-             which is why `current_handler` must put the user's own file first"
+             which is why `resolve` must put the user's own file first"
         );
-        assert_eq!(effective_handler(&[]), None);
+        assert_eq!(winner(vec![]), Vec::<String>::new());
         // A file that has never heard of the scheme is not a claim on it.
-        let unrelated = "[Default Applications]\nx-scheme-handler/http=firefox.desktop;";
-        assert_eq!(effective_handler(&[unrelated.to_string()]), None);
+        let unrelated = (
+            PathBuf::from("/etc/xdg/mimeapps.list"),
+            "[Default Applications]\nx-scheme-handler/http=firefox.desktop;".to_string(),
+        );
+        assert_eq!(winner(vec![unrelated]), Vec::<String>::new());
+    }
+
+    /// The machine this whole change exists for, as a fixture: the scheme
+    /// declared **twice by two different applications**, one group apart.
+    ///
+    /// Verbatim in shape - the two groups in one file, GMM in the added group
+    /// and nxmproxy in the default one - because that is what the user was
+    /// staring at and could not interpret from a bare application name.
+    #[test]
+    fn two_applications_declaring_the_scheme_are_both_named_and_one_wins() {
+        let file = PathBuf::from("/home/u/.config/mimeapps.list");
+        let resolution = chain(&[(
+            file.clone(),
+            format!(
+                "[Added Associations]\n\
+                 {MIME_TYPE}=gamemodmanager-nxm.desktop;\n\n\
+                 [Default Applications]\n\
+                 {MIME_TYPE}={DESKTOP_FILE};"
+            ),
+        )]);
+
+        assert_eq!(
+            resolution.claimants(),
+            vec![DESKTOP_FILE, "gamemodmanager-nxm.desktop"],
+            "both applications must be named, and the winner first"
+        );
+        assert_eq!(resolution.handler().as_deref(), Some(DESKTOP_FILE));
+        assert!(
+            owns(&resolution),
+            "the default group outranks the added group"
+        );
+        assert_eq!(
+            resolution.rule, "[Default Applications] outranks [Added Associations]",
+            "the rule has to be checkable by hand against the file"
+        );
+        // And each row says where it came from, which is the whole diagnostic.
+        let rows: Vec<(&str, &str, String)> = resolution
+            .declarations
+            .iter()
+            .map(|d| (d.section.as_str(), d.source.as_str(), d.ids.join(";")))
+            .collect();
+        assert_eq!(
+            rows,
+            vec![
+                (
+                    "Default Applications",
+                    file.to_str().unwrap(),
+                    DESKTOP_FILE.to_string()
+                ),
+                (
+                    "Added Associations",
+                    file.to_str().unwrap(),
+                    "gamemodmanager-nxm.desktop".to_string()
+                ),
+            ],
+            "every candidate, in precedence order, each with its group and its file"
+        );
+    }
+
+    /// The same two applications in the opposite order: GMM holds the default
+    /// group, and nxmproxy is only an added association.
+    ///
+    /// This is the state that makes `install`'s "verified" a lie, so it is worth
+    /// a test of its own rather than a variant of the one above.
+    #[test]
+    fn the_wrong_application_in_the_default_group_wins_and_nxmproxy_is_bypassed() {
+        let resolution = chain(&[(
+            PathBuf::from("/home/u/.config/mimeapps.list"),
+            format!(
+                "[Added Associations]\n\
+                 {MIME_TYPE}={DESKTOP_FILE};\n\n\
+                 [Default Applications]\n\
+                 {MIME_TYPE}=gamemodmanager-nxm.desktop;"
+            ),
+        )]);
+        assert_eq!(
+            resolution.handler().as_deref(),
+            Some("gamemodmanager-nxm.desktop")
+        );
+        assert!(
+            !owns(&resolution),
+            "an added association is not ownership, whatever it says"
+        );
+        assert_eq!(resolution.claimants().len(), 2);
+    }
+
+    /// No default anywhere: the desktop falls back to `[Added Associations]`,
+    /// and so must we. Reporting "nobody claims nxm://" there is a factually
+    /// wrong answer about a machine that has just told us who handles it.
+    #[test]
+    fn an_added_association_alone_still_names_the_application_that_gets_the_link() {
+        let resolution = chain(&[(
+            PathBuf::from("/home/u/.config/mimeapps.list"),
+            format!("[Added Associations]\n{MIME_TYPE}={DESKTOP_FILE};\n"),
+        )]);
+        assert_eq!(
+            resolution.handler().as_deref(),
+            Some(DESKTOP_FILE),
+            "the desktop's documented fallback is to use the added association"
+        );
+        assert!(owns(&resolution));
+        assert_eq!(resolution.rule, "the only declaration on this machine");
+    }
+
+    /// An entry that lists nothing is not a claim. `uninstall` leaves the key
+    /// removed, but a hand-edited file and a half-finished `xdg-mime` both
+    /// produce `key=;`, and that names no application.
+    #[test]
+    fn an_empty_value_is_not_a_declaration() {
+        let resolution = chain(&[(
+            PathBuf::from("/home/u/.config/mimeapps.list"),
+            format!("[Default Applications]\n{MIME_TYPE}=;\n"),
+        )]);
+        assert!(resolution.declarations.is_empty(), "{:?}", resolution);
+        assert_eq!(resolution.handler(), None);
+        assert!(!owns(&resolution));
+        assert_eq!(
+            resolution.rule,
+            "no file on this machine declares x-scheme-handler/nxm"
+        );
+    }
+
+    #[test]
+    fn both_groups_are_read_from_one_file_in_precedence_order() {
+        let text = "[Added Associations]\n\
+                    x-scheme-handler/nxm=vortex.desktop;\n\n\
+                    [Default Applications]\n\
+                    x-scheme-handler/nxm=gamemodmanager-nxm.desktop;\n";
+        assert_eq!(
+            associations(text, MIME_TYPE),
+            vec![
+                (
+                    "Default Applications",
+                    vec!["gamemodmanager-nxm.desktop".to_string()]
+                ),
+                ("Added Associations", vec!["vortex.desktop".to_string()]),
+            ],
+            "the group order is the precedence order, regardless of file order"
+        );
+        // A file with only one of the two still yields that one.
+        assert_eq!(
+            associations(
+                "[Added Associations]\nx-scheme-handler/nxm=a.desktop;",
+                MIME_TYPE
+            )
+            .len(),
+            1
+        );
+        assert!(associations(
+            "[Default Applications]\nx-scheme-handler/http=a.desktop;",
+            MIME_TYPE
+        )
+        .is_empty());
+    }
+
+    #[test]
+    fn group_names_are_matched_the_way_the_specification_spelles_them() {
+        // Lower case, and with the space inside the brackets trimmed: both are
+        // hand-edits that appear in real files and neither may lose the entry.
+        assert_eq!(
+            group_ids(
+                "[default applications]\nx-scheme-handler/nxm=a.desktop;",
+                "Default Applications",
+                MIME_TYPE
+            )
+            .as_deref(),
+            Some(&["a.desktop".to_string()][..])
+        );
+        assert_eq!(
+            group_ids(
+                "[ Added Associations ]\nx-scheme-handler/nxm=b.desktop;",
+                SECTION_ADDED,
+                MIME_TYPE
+            )
+            .as_deref(),
+            Some(&["b.desktop".to_string()][..])
+        );
+        assert_eq!(
+            group_ids(
+                "[Added Associations]\nx-scheme-handler/nxm=a.desktop;",
+                GROUP,
+                MIME_TYPE
+            ),
+            None,
+            "the groups are not interchangeable"
+        );
     }
 
     #[test]

@@ -75,11 +75,15 @@ pub enum Route {
 }
 
 impl Route {
-    /// The domain this route was made for, either way.
-    pub fn domain(&self) -> &str {
+    /// The manager this link goes to, if any.
+    ///
+    /// So the log can name the manager next to the argv it was given, instead
+    /// of the argv alone: "the link went somewhere" and "the link went to the
+    /// thing you registered" are different claims.
+    pub fn manager_id(&self) -> Option<&str> {
         match self {
-            Route::Manager { domain, .. } => domain,
-            Route::Unhandled { domain, .. } => domain,
+            Route::Manager { manager_id, .. } => Some(manager_id),
+            Route::Unhandled { .. } => None,
         }
     }
 
@@ -214,28 +218,52 @@ pub fn deliver(route: &Route, url: &str) -> Result<(), String> {
     };
 
     if let Some(pipe_name) = manager.pipe.as_deref() {
-        logger::info(format!("trying pipe {pipe_name} for manager {manager_id}"));
+        logger::info(format!(
+            "pipe manager={manager_id:?} pipe={pipe_name:?} result=trying"
+        ));
         if pipe::try_write_pipe(pipe_name, url) {
-            logger::info(format!("delivered over pipe {pipe_name}"));
+            logger::info(format!(
+                "pipe manager={manager_id:?} pipe={pipe_name:?} result=delivered"
+            ));
             return Ok(());
         }
         // Not necessarily a problem: the manager is probably not running yet.
         logger::info(format!(
-            "pipe {pipe_name} write failed, falling back to spawning"
+            "pipe manager={manager_id:?} pipe={pipe_name:?} result=unavailable action=spawning"
         ));
     }
 
     let (exec, args) = spawn_args(manager, url);
-    logger::info(format!("spawning manager {manager_id}: {exec} {args:?}"));
 
-    Command::new(&exec)
+    // THE dispatch record. Manager, exact argv, and whether the process
+    // actually started - or the OS's own words on why it did not.
+    //
+    // The failure this exists for is silent: a link reaches nxmproxy, the
+    // manager is missing or not executable, `spawn` returns an error, we exit
+    // 1 into a terminal nobody is watching, and the user sees a browser click
+    // that did nothing. Everything else about a working link is invisible too.
+    // `argv` is Rust's debug form so it stays on one line and a url containing
+    // a space or a quote cannot break the record into two.
+    let record = format!("spawn manager={manager_id:?} exec={exec:?} argv={args:?}");
+    match Command::new(&exec)
         .args(&args)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .spawn()
-        .map(|_| ()) // deliberately dropped: we do not wait, and must not.
-        .map_err(|e| format!("could not start mod manager {manager_id:?} ({exec}): {e}"))
+    {
+        Ok(_) => {
+            logger::info(format!("{record} result=started"));
+            Ok(())
+        }
+        Err(e) => {
+            logger::error(format!("{record} result=failed err={e:?}"));
+            // Deliberately dropped on success: we do not wait, and must not.
+            Err(format!(
+                "could not start mod manager {manager_id:?} ({exec}): {e}"
+            ))
+        }
+    }
 }
 
 #[cfg(test)]

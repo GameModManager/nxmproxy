@@ -45,6 +45,11 @@ use crate::platform::Claim;
 
 const SCHEME: &str = "nxm";
 pub const BUNDLE_ID: &str = "org.gamemodmanager.nxmproxy";
+
+/// The id this platform registers nxmproxy under, which is what LaunchServices
+/// reports when nxmproxy is the handler. See [`crate::platform::Status`] for
+/// why `test` needs to compare it.
+pub const OWN_ID: &str = BUNDLE_ID;
 const LSREGISTER: &str =
     "/System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister";
 
@@ -323,6 +328,30 @@ pub fn is_registered() -> Result<bool, String> {
 /// `LSCopyDefaultHandlerForURLScheme`, which this fork does not do. Says so.
 pub fn current_handler() -> Result<Option<String>, String> {
     Ok(None)
+}
+
+/// Read the machine's answer: which is not available here.
+///
+/// Deliberately an **empty** chain rather than a guess. macOS 12+ turns
+/// `LSSetDefaultHandlerForURLScheme` into a user prompt, so the answer is
+/// whatever the user clicked in System Settings and there is no non-interactive
+/// way to read it back. An empty chain says "I do not know"; a guessed one would
+/// say "I know, and it is fine", which is the false green this whole type
+/// exists to remove. `test` prints the caveat that says which of the two it is.
+pub fn resolve() -> crate::platform::Resolution {
+    crate::platform::Resolution {
+        declarations: Vec::new(),
+        rule: "the default handler cannot be read without a GUI session; check \
+                System Settings > General > Login Items & Extensions"
+            .to_string(),
+        // The whole reason this one is empty is that nobody here could look.
+        readable: false,
+    }
+}
+
+/// Never true here, and never anything else: see [`resolve`].
+pub fn owns(_resolution: &crate::platform::Resolution) -> bool {
+    false
 }
 
 #[cfg(test)]

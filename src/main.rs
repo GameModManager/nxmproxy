@@ -28,7 +28,7 @@ use route::Route;
 
 /// Bumped when the `list --json` shape changes, so a GUI can refuse a format
 /// it does not understand instead of misreading it.
-const LIST_SCHEMA_VERSION: u32 = 3;
+const LIST_SCHEMA_VERSION: u32 = 5;
 
 #[derive(Parser, Debug)]
 #[command(
@@ -299,6 +299,34 @@ struct JsonList<'a> {
     /// one-click registration; a user who has already run `discover` reads
     /// `managers[].discovered` instead.
     declared_managers: Vec<JsonDeclaredManager>,
+    /// What the OS says handles `nxm://`, or `null` when nothing claims it.
+    ///
+    /// From the same read `nxmproxy test` prints, so a GUI cannot report a
+    /// different answer from the CLI.
+    handler: Option<String>,
+    /// True when **nxmproxy** is that handler.
+    ///
+    /// The field that stops the false green. Everything above describes
+    /// capability - a published entry, a registered manager, an assignment -
+    /// and a GUI that renders all of it green while nxmproxy is bypassed shows
+    /// the user a working install over one that routes nothing. This is the
+    /// single fact that distinguishes them, and it is the same one `test`
+    /// exits on.
+    owns_scheme: bool,
+    /// The whole resolution, in the order the OS considered it.
+    ///
+    /// Not a summary of `handler`: this is the evidence behind it. Every
+    /// declaration with **the file it came from and the group it is in**, plus
+    /// the rule that made `declarations[0]` the winner. A GUI that renders
+    /// `owns_scheme: false` next to nothing else leaves the user in exactly the
+    /// position this change was made to end - knowing nxmproxy lost, with no
+    /// way to see who beat it or where they said so.
+    ///
+    /// A contest is two or more distinct `ids` across `declarations`; the first
+    /// `ids` entry of each is the application that would get the link. There is
+    /// no precomputed `conflicting` flag because it is one comparison, and a
+    /// derived field is one more thing that can disagree with the data.
+    scheme: platform::Resolution,
     warnings: &'a [String],
 }
 
@@ -560,6 +588,13 @@ fn known_managers_json() -> &'static [JsonKnownManager] {
 }
 
 fn list_json(config: &Config, loaded: &config::Loaded, dir: &Path) -> String {
+    // The same read, through the same predicate, that `install` verifies with
+    // and `test` exits on. `list` is exempt from no rule: a JSON contract that
+    // could render a false green is the exact failure this field exists to
+    // stop, so a GUI reading it cannot end up greener than the terminal.
+    let resolution = scheme_ownership();
+    let handler = resolution.handler();
+    let owns = resolution.owns();
     let payload = JsonList {
         version: LIST_SCHEMA_VERSION,
         config_path: dir.join(config::CONFIG_FILE).to_string_lossy().into_owned(),
@@ -599,6 +634,9 @@ fn list_json(config: &Config, loaded: &config::Loaded, dir: &Path) -> String {
             })
             .collect(),
         warnings: &loaded.warnings,
+        handler,
+        owns_scheme: owns,
+        scheme: resolution,
     };
     // BTreeMaps plus declared field order make this byte stable across runs.
     serde_json::to_string_pretty(&payload).expect("the list payload is all owned, printable data")
@@ -799,6 +837,20 @@ fn games_of(config: &Config, id: &str) -> Vec<String> {
 /// manager found by the back door with no games under it is self-evident.
 fn print_list(config: &Config, loaded: &config::Loaded, dir: &Path) {
     println!("config: {}", dir.join(config::CONFIG_FILE).display());
+    // Second line, above the table, because it is the one fact that decides
+    // whether anything in the table is reachable at all: if nxmproxy does not
+    // hold `nxm://`, no assignment below is ever consulted by the desktop.
+    // A routing table printed on its own implies a working setup.
+    //
+    // One line, not the chain. `test` is where the resolution is explained; this
+    // is the verdict only, so `list` stays a table.
+    let resolution = scheme_ownership();
+    let handler = handler_name(&resolution);
+    let foreign = handler != "nothing" && !resolution.owns();
+    println!(
+        "nxm:// handler: {handler}{}",
+        if foreign { " (not nxmproxy)" } else { "" }
+    );
     for warning in &loaded.warnings {
         eprintln!("warning: {warning}");
     }
@@ -843,12 +895,21 @@ fn print_list(config: &Config, loaded: &config::Loaded, dir: &Path) {
 }
 
 /// Forward one link. Exit code is the answer: 0 delivered, 1 not.
+///
+/// Four log events, one line each, machine-greppable, covering the whole life of
+/// a link: it arrived, who it resolved to, exactly what argv it went out with,
+/// and whether the spawn took. This is the diagnostic the user asked for, and
+/// it is the only place it can live: the OS launches us with no terminal and we
+/// exit in milliseconds, so when a link does not arrive the reason cannot be
+/// printed to anybody. It has to already be in the file.
 fn handle_url(config: &Config, url: &str) -> i32 {
+    logger::info(format!("link url={url:?}"));
+
     let domain = match route::domain_of(url) {
         Ok(domain) => domain,
         Err(message) => {
             eprintln!("nxmproxy: {message}");
-            logger::error(&message);
+            logger::error(format!("route result=rejected reason={message:?}"));
             return 1;
         }
     };
@@ -857,22 +918,131 @@ fn handle_url(config: &Config, url: &str) -> i32 {
     if let Route::Unhandled { domain, reason } = &route {
         let message = format!("nxmproxy: {}", reason.message(domain));
         eprintln!("{message}");
-        logger::error(&message);
+        logger::error(format!(
+            "route domain={domain:?} manager=none result=unrouted reason={}",
+            reason_tag(reason)
+        ));
         return 1;
     }
 
-    logger::info(format!("routing {url} -> {}", route.domain()));
+    logger::info(format!(
+        "route domain={domain:?} manager={:?} result=routed",
+        // `unwrap_or_default`, not `{:?}` on the Option: `Some("vortex")` in a
+        // `key=value` line is a Rust type leaking into a format that claims to
+        // be greppable, and `manager=Some(` is not a token anyone can match.
+        route.manager_id().unwrap_or_default()
+    ));
     match route::deliver(&route, url) {
         Ok(()) => 0,
         Err(message) => {
             eprintln!("nxmproxy: {message}");
-            logger::error(&message);
+            logger::error(format!(
+                "route domain={domain:?} result=undelivered reason={message:?}"
+            ));
             1
         }
     }
 }
 
+/// The one word a log reader can grep for to say why a domain was unrouted.
+///
+/// [`Reason::message`] is the human sentence and it spans two lines with an
+/// indented command in it, which is not greppable and not one line per event.
+/// The tag carries the same three-way distinction without the prose.
+fn reason_tag(reason: &route::Reason) -> &'static str {
+    match reason {
+        route::Reason::NoManagers => "no-managers",
+        route::Reason::Ambiguous(_) => "ambiguous",
+        route::Reason::Unassigned(_) => "unassigned",
+    }
+}
+
+/// Ask the OS who owns `nxm://`, and write the answer down.
+///
+/// One function for three commands, because three independent readings of the
+/// same question are how they came to disagree: `install` used to decide from
+/// the [`platform::Claim`] it was handed, `test` from `is_registered`, and
+/// `list --json` did not ask at all. They now answer from this.
+///
+/// The log is the point of it as much as the return value. A link that never
+/// arrives leaves no stdout to read - we are launched by the OS with no terminal
+/// and exit in milliseconds - so "who held the scheme when you ran install", and
+/// "which of two declared applications outranked the other", have to be
+/// recoverable afterwards rather than remembered.
+///
+/// One line per declaration and one for the verdict, all machine-greppable: a
+/// reader asking "who owned nxm:// at 14:02" wants `grep '^scheme '`, not a
+/// paragraph.
+fn scheme_ownership() -> platform::Resolution {
+    let resolution = platform::imp::resolve();
+    let owns = resolution.owns();
+    for (rank, declaration) in resolution.declarations.iter().enumerate() {
+        logger::info(format!(
+            "scheme declaration rank={} section={:?} ids={:?} source={:?}",
+            rank + 1,
+            declaration.section,
+            declaration.ids,
+            declaration.source
+        ));
+    }
+    logger::info(format!(
+        "scheme handler={:?} owns={owns} rule={:?}",
+        resolution.handler().unwrap_or_else(|| "none".to_string()),
+        resolution.rule
+    ));
+    if !owns {
+        logger::warn(format!(
+            "nxmproxy does not own nxm://; {} does",
+            resolution
+                .handler()
+                .unwrap_or_else(|| "nothing".to_string())
+        ));
+    }
+    resolution
+}
+
+/// The handler's name for a user, or a word for "nobody".
+fn handler_name(resolution: &platform::Resolution) -> String {
+    resolution
+        .handler()
+        .unwrap_or_else(|| "nothing".to_string())
+}
+
+/// The resolution chain, as the lines a user reads and a test pins.
+///
+/// Every candidate, in the order the OS would consider them, each with **the
+/// group it came from and the file it is in**, then the winner and the rule that
+/// made it the winner. A bare application name could not be checked by hand and
+/// could not tell a real conflict from a ranked list; this can be read against
+/// the file in either direction.
+///
+/// Two facts about *different applications* is its own line, because that is the
+/// state that is indistinguishable from a working setup without it.
+fn print_resolution(resolution: &platform::Resolution) {
+    println!("nxm:// resolution, highest precedence first:");
+    for declaration in &resolution.declarations {
+        println!(
+            "  {:<22} {}  <- {}",
+            declaration.section,
+            declaration.ids.join(" "),
+            declaration.source
+        );
+    }
+    match resolution.winner() {
+        None => println!("  {}", resolution.rule),
+        Some(winner) => println!("  winner: {} - {}", winner.ids.join(" "), resolution.rule),
+    }
+    let claimants = resolution.claimants();
+    if claimants.len() > 1 {
+        println!(
+            "  declared by more than one application: {}",
+            claimants.join(", ")
+        );
+    }
+}
+
 fn handle_test() -> i32 {
+    let resolution = scheme_ownership();
     let status = Status {
         registered: match platform::imp::is_registered() {
             Ok(registered) => registered,
@@ -881,7 +1051,6 @@ fn handle_test() -> i32 {
                 return 1;
             }
         },
-        handler: platform::imp::current_handler().unwrap_or(None),
         caveat: if cfg!(target_os = "macos") {
             Some(
                 "the default handler cannot be read on macOS; check System Settings > General \
@@ -894,15 +1063,39 @@ fn handle_test() -> i32 {
     };
 
     println!("registered: {}", status.registered);
-    match &status.handler {
-        Some(handler) => println!("nxm:// handler: {handler}"),
-        None => println!("nxm:// handler: none"),
-    }
+    println!("nxm:// handler: {}", handler_name(&resolution));
+    // The line that was missing. `registered: true` above means "nxmproxy is one
+    // of the applications this desktop may offer for nxm://", which is what
+    // `install` publishes and is true the moment it runs. It says nothing about
+    // whether nxmproxy is the one that gets the link, and printing it alone is
+    // how a bypassed install reads as a working one.
+    println!(
+        "nxmproxy handles nxm://: {}",
+        if resolution.owns() { "yes" } else { "no" }
+    );
+    print_resolution(&resolution);
     if let Some(caveat) = &status.caveat {
         println!("note: {caveat}");
     }
-    // Upstream's contract, kept: a non-zero code means "not installed".
-    i32::from(!status.registered)
+    // Upstream's contract, kept: a non-zero code means "not working". It is no
+    // longer the same thing as "not installed", because those are now separable
+    // facts:
+    //
+    //   1  nxmproxy is not even published as a handler
+    //   3  it is published, and nxmproxy still does not hold the scheme
+    //
+    // 3 is `EXIT_NEEDS_USER` for the same reason `install` returns it: nothing
+    // failed, the platform allows nothing further, and the remaining step is a
+    // click in settings. A caller that only cares whether nxm:// works has a
+    // single answer now, and a caller that distinguishes the two cases still
+    // can.
+    if !status.registered {
+        platform::EXIT_FAILED
+    } else if resolution.owns() {
+        platform::EXIT_OK
+    } else {
+        platform::EXIT_NEEDS_USER
+    }
 }
 
 /// Compose `install`: publish nxmproxy, claim `nxm://`, and make sure a link
@@ -972,14 +1165,73 @@ fn handle_install(config: &mut Config, save: &dyn Fn(&Config) -> i32) -> i32 {
         code = platform::EXIT_NEEDS_USER;
     }
 
-    if claim.claimed {
+    // **Verify, do not believe.** Everything above worked from the [`Claim`] it
+    // was handed, which is a statement about what we asked for. The only fact a
+    // user cares about is what the machine now says, so it is read back here -
+    // by the same function `test` and `list` use, and logged, so a claim that
+    // did not take can be read later instead of guessed at.
+    let resolution = scheme_ownership();
+    if resolution.owns() {
         println!("nxm:// links now open in nxmproxy.");
-    } else {
-        println!("nxmproxy is registered as an nxm:// handler.");
-        println!("One step is left for you to do:");
-        println!("{}", claim.instruction);
+        return code;
     }
-    code
+    for line in claim_refusal(&resolution, &claim.instruction) {
+        println!("{line}");
+    }
+    // Nothing failed here; the platform allowed nothing further and one click
+    // remains. Never 0 over a scheme nxmproxy does not hold.
+    if code == platform::EXIT_OK {
+        platform::EXIT_NEEDS_USER
+    } else {
+        code
+    }
+}
+
+/// What `install` says after asking for the scheme and reading back, given that
+/// it did not get it. Never called when it did.
+///
+/// Pure, and extracted from the middle of [`handle_install`] for a reason that
+/// is not tidiness: the decision "is this a verified claim or a request that
+/// did not take" is the one this command exists to get right, and inline in a
+/// thirty-line function it had no reachable control. A mutation that swapped the
+/// read for the [`Claim`] it was handed went **green** on the end-to-end test,
+/// because on Linux `claim()` happens to verify by the very same read - so the
+/// two paths were indistinguishable there and the branch was untested. Here they
+/// are distinguishable, and a caller that has just read the machine cannot
+/// accidentally believe something else.
+///
+/// `instruction` is what the platform said to do about it, and is never empty
+/// when the platform could not take the claim.
+fn claim_refusal(resolution: &platform::Resolution, instruction: &str) -> Vec<String> {
+    let mut lines = vec!["nxmproxy is registered as an nxm:// handler.".to_string()];
+    match resolution.winner() {
+        // Someone else still gets the link. Say who **and from where**: a bare
+        // application name is exactly what the user could not act on last time.
+        Some(winner) => lines.push(format!(
+            "nxm:// still opens with {}, from [{}] of {}",
+            winner.ids.join(" "),
+            winner.section,
+            winner.source
+        )),
+        // The chain was read and says nobody claims it. That is a fact.
+        None if resolution.readable => {
+            lines.push("nxm:// has no default handler; the desktop will ask.".to_string())
+        }
+        // The platform cannot answer at all. Saying "nothing claims nxm://" here
+        // would be a confident sentence about something nobody looked at.
+        None => lines.push(
+            "nxm:// still opens with nxmproxy. nxmproxy cannot read \
+                            the answer back here, so it will not claim it either."
+                .to_string(),
+        ),
+    }
+    lines.push("One step is left for you to do:".to_string());
+    lines.push(if instruction.is_empty() {
+        "Set nxm:// in your desktop's default applications settings.".to_string()
+    } else {
+        instruction.to_string()
+    });
+    lines
 }
 
 /// Compose `uninstall`: give the scheme back, then remove what we published.

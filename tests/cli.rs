@@ -129,6 +129,47 @@ impl Drop for Sandbox {
     }
 }
 
+/// Paths locked read-only, restored when this goes out of scope.
+///
+/// The sandbox deletes itself in `Drop`, and `remove_dir_all` needs write
+/// permission on every directory it descends into. A test that locks a
+/// directory to prove a write is refused has to give the permissions back, or
+/// it leaves an undeletable tree in `TMPDIR` for the next run to trip over.
+#[cfg(target_os = "linux")]
+struct ReadOnly(Vec<PathBuf>);
+
+#[cfg(target_os = "linux")]
+impl ReadOnly {
+    /// `dir` refuses new files and `file` refuses writes, which is every way
+    /// `xdg-mime` has of writing a claim.
+    fn lock(dir: &Path, file: &Path) -> Self {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(file, std::fs::Permissions::from_mode(0o444)).unwrap();
+        std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o555)).unwrap();
+        ReadOnly(vec![dir.to_path_buf(), file.to_path_buf()])
+    }
+
+    /// Did the lock actually stop this process writing?
+    ///
+    /// Root ignores mode bits, so on a root runner the refusal cannot be
+    /// produced. The caller has to be able to tell that apart from "the lock
+    /// works", and a test that cannot tell must not assert a refusal it did not
+    /// observe.
+    fn held(&self) -> bool {
+        std::fs::write(self.0[0].join(".probe"), b"").is_err()
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl Drop for ReadOnly {
+    fn drop(&mut self) {
+        use std::os::unix::fs::PermissionsExt;
+        for path in &self.0 {
+            let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755));
+        }
+    }
+}
+
 fn run(sandbox: &Sandbox, args: &[&str]) -> Output {
     Command::new(BIN)
         .args(args)
@@ -1002,6 +1043,338 @@ fn install_and_uninstall_round_trip() {
     );
 }
 
+// ---------------------------------------------------------------------------
+// Explaining the resolution.
+//
+// The machine this was written for had the scheme declared TWICE, by two
+// different applications:
+//
+//     [Added Associations]    x-scheme-handler/nxm=gamemodmanager-nxm.desktop;
+//     [Default Applications]  x-scheme-handler/nxm=nxmproxy.desktop
+//
+// Per XDG the second outranks the first, so nxmproxy did win - and `test`
+// printed `nxm:// handler: nxmproxy.desktop` with nothing else, which is not
+// checkable against the file and looks exactly like the message for the case
+// where it did not. A tool that resolves a handler has to be able to explain
+// the resolution.
+// ---------------------------------------------------------------------------
+
+/// The user's own `mimeapps.list`, verbatim in shape.
+///
+/// Both groups, both applications, in one file. Returned as a string because
+/// three tests below need the same bytes and a fixture that each test retypes is
+/// three fixtures that can drift apart.
+#[cfg(target_os = "linux")]
+const CONFLICTING_MIMEAPPS: &str = "[Added Associations]\n\
+                                    x-scheme-handler/nxm=gamemodmanager-nxm.desktop;\n\n\
+                                    [Default Applications]\n\
+                                    x-scheme-handler/nxm=nxmproxy.desktop\n";
+
+/// The machine this whole change came from: GMM is what the desktop opens, and
+/// nxmproxy's own added association is still sitting in the file, untouched.
+///
+/// The mirror image of [`CONFLICTING_MIMEAPPS`] - there nxmproxy wins the
+/// contest, here it loses it - and losing is the case the tool used to get
+/// wrong. Both groups are named in both fixtures, so the only difference is
+/// which one is `[Default Applications]`, which is exactly the fact a reader
+/// could not previously see.
+#[cfg(target_os = "linux")]
+const BYPASSED_MIMEAPPS: &str = "[Added Associations]\n\
+                                   x-scheme-handler/nxm=nxmproxy.desktop;\n\n\
+                                   [Default Applications]\n\
+                                   x-scheme-handler/nxm=gamemodmanager-nxm.desktop;\n";
+
+/// Put the conflicting file where the desktop reads it, and publish nxmproxy.
+///
+/// `install` re-writes `[Default Applications] x-scheme-handler/nxm=nxmproxy.desktop`,
+/// which on this fixture is already there, so the claim is a no-op and the
+/// conflict the tests are about survives it - asserted below rather than
+/// assumed, because a fixture that moved is a fixture that is no longer the
+/// case.
+///
+/// The install itself exits 3: the scheme is held, but nothing is registered to
+/// forward a link to, and that is a separate fact from this one.
+#[cfg(target_os = "linux")]
+fn seeded_conflict(sandbox: &Sandbox) {
+    std::fs::create_dir_all(sandbox.xdg_config_home()).unwrap();
+    std::fs::write(sandbox.mimeapps(), CONFLICTING_MIMEAPPS).unwrap();
+    let installed = run(sandbox, &["install"]);
+    assert_eq!(
+        code(&installed),
+        3,
+        "holds the scheme, but has no mod manager to forward to: {}{}",
+        stdout(&installed),
+        stderr(&installed)
+    );
+    assert!(
+        stdout(&installed).contains("nxm:// links now open in nxmproxy."),
+        "nxmproxy does hold the scheme on this fixture: {}",
+        stdout(&installed)
+    );
+    assert_eq!(
+        std::fs::read_to_string(sandbox.mimeapps()).unwrap(),
+        CONFLICTING_MIMEAPPS,
+        "install changed the fixture, so it is no longer the case under test"
+    );
+}
+
+/// `test` explains the whole resolution, and the answer can be checked against
+/// the file by hand.
+///
+/// Whole-stream, like [`list_is_exactly_the_documented_shape`] and for the same
+/// reason: a substring check passes on prose nobody wrote an assertion for.
+/// Every line here is either a fact about a file on disk or the rule that picks
+/// between them, and a fifth line of commentary would break this.
+#[cfg(target_os = "linux")]
+#[test]
+fn test_explains_a_scheme_two_applications_both_declare() {
+    let sandbox = Sandbox::new("chain");
+    let _lock = install_sandbox(&sandbox);
+    seeded_conflict(&sandbox);
+
+    let tested = run(&sandbox, &["test"]);
+    assert_eq!(code(&tested), 0, "{}{}", stdout(&tested), stderr(&tested));
+
+    let mimeapps = sandbox.mimeapps();
+    assert_eq!(
+        stdout(&tested),
+        format!(
+            "registered: true\n\
+             nxm:// handler: nxmproxy.desktop\n\
+             nxmproxy handles nxm://: yes\n\
+             nxm:// resolution, highest precedence first:\n\
+             \x20 Default Applications   nxmproxy.desktop  <- {mimeapps}\n\
+             \x20 Added Associations     gamemodmanager-nxm.desktop  <- {mimeapps}\n\
+             \x20 winner: nxmproxy.desktop - [Default Applications] outranks \
+             [Added Associations]\n\
+             \x20 declared by more than one application: nxmproxy.desktop, \
+             gamemodmanager-nxm.desktop\n",
+            mimeapps = mimeapps.display()
+        ),
+        "the chain must name every candidate, its file, its group, the winner and \
+         the rule"
+    );
+}
+
+/// The exit code is the answer, and "registered" is not the answer.
+///
+/// This is the state the user was in after setting the default back to GMM by
+/// hand: nxmproxy is still published as a handler, so `registered: true` is
+/// true, and the scheme is being handed to somebody else. Before this, that
+/// printed a green-looking pair of lines and exited 0.
+#[cfg(target_os = "linux")]
+#[test]
+fn test_exits_truthfully_when_registered_but_bypassed() {
+    let sandbox = Sandbox::new("bypassed");
+    let _lock = install_sandbox(&sandbox);
+    seeded_conflict(&sandbox);
+
+    // The user picks GameMod Manager in Settings > Default Applications. The
+    // desktop writes the default group; nxmproxy's added association, which is
+    // what `install` published it as, is untouched and still in the file.
+    std::fs::write(
+        sandbox.mimeapps(),
+        "[Added Associations]\nx-scheme-handler/nxm=nxmproxy.desktop;\n\n\
+         [Default Applications]\nx-scheme-handler/nxm=gamemodmanager-nxm.desktop;\n",
+    )
+    .unwrap();
+
+    let tested = run(&sandbox, &["test"]);
+    let text = stdout(&tested);
+    assert!(
+        text.contains("registered: true"),
+        "nxmproxy is still published, and saying otherwise would be its own lie: {text}"
+    );
+    assert!(
+        text.contains("nxmproxy handles nxm://: no"),
+        "the fact that decides everything else: {text}"
+    );
+    assert_eq!(
+        code(&tested),
+        3,
+        "registered but bypassed is not done, and it is not a failure either: {text}"
+    );
+    assert_ne!(
+        code(&tested),
+        0,
+        "exit 0 here is the trap this test exists for"
+    );
+    // And the resolution names who beat us and from where, so the next command
+    // is a file to open rather than a guess.
+    assert!(
+        text.contains("winner: gamemodmanager-nxm.desktop"),
+        "{text}"
+    );
+    assert!(
+        text.contains(
+            "declared by more than one application: nxmproxy.desktop, \
+                      gamemodmanager-nxm.desktop"
+        ) || text.contains(
+            "declared by more than one application: gamemodmanager-nxm.desktop, \
+                      nxmproxy.desktop"
+        ),
+        "both applications must be named: {text}"
+    );
+}
+
+/// `install` must verify, not believe.
+///
+/// The reachable way to get here is not a mock: `xdg-mime` on this machine is a
+/// shell script that **exits 0 after failing to write**. Verified directly -
+/// with the target directory read-only it prints "Permission denied" and still
+/// returns 0 - which means the exit code is worthless as evidence and the read
+/// back is the only thing that is not. Before the read back, this printed
+/// "nxm:// links now open in nxmproxy" while GMM held the scheme.
+#[cfg(target_os = "linux")]
+#[test]
+fn install_says_plainly_when_it_could_not_take_the_claim() {
+    let sandbox = Sandbox::new("claim-refused");
+    let _lock = install_sandbox(&sandbox);
+    std::fs::create_dir_all(sandbox.xdg_config_home()).unwrap();
+    std::fs::write(sandbox.mimeapps(), CONFLICTING_MIMEAPPS).unwrap();
+
+    // **Deny the write, then prove the denial.** This test used to write the
+    // fixture, find the sandbox was still writable, print a note and `return` -
+    // so on an ordinary machine it asserted nothing at all and came back green.
+    // A control that cannot fail is not a control.
+    //
+    // The mode bits are the only lever, and they are sufficient: `xdg-mime` is a
+    // shell script that writes `mimeapps.list.new` beside its target, prints
+    // "Permission denied" on stderr and **exits 0 anyway** (verified by hand).
+    // So there is no error code to wait for, the file must not be writable, and
+    // the directory must refuse new files - between them that closes every way
+    // it has of writing.
+    let read_only = ReadOnly::lock(&sandbox.xdg_config_home(), &sandbox.mimeapps());
+    if !read_only.held() {
+        eprintln!(
+            "note: still able to write into the sandbox config dir despite the \
+                  mode bits (root?); the claim-refusal case cannot be produced."
+        );
+        return;
+    }
+
+    let installed = run(&sandbox, &["install"]);
+    let text = format!("{}{}", stdout(&installed), stderr(&installed));
+    assert!(
+        !text.contains("nxm:// links now open in nxmproxy"),
+        "install reported a claim it did not take: {text}"
+    );
+    assert!(
+        text.contains(&format!(
+            "nxm:// still opens with gamemodmanager-nxm.desktop, from \
+             [Added Associations] of {}",
+            sandbox.mimeapps().display()
+        )),
+        "install must name who still holds the scheme and where it says so: {text}"
+    );
+    assert_eq!(
+        code(&installed),
+        3,
+        "published, claimed, and not the handler: one step left for the user: {text}"
+    );
+
+    // And `test` agrees with `install`, from its own read.
+    let tested = run(&sandbox, &["test"]);
+    assert_eq!(
+        code(&tested),
+        3,
+        "two commands, one answer: {}{}",
+        stdout(&tested),
+        stderr(&tested)
+    );
+}
+
+/// The JSON carries the same facts, so a GUI cannot render a false green.
+///
+/// Not a re-assertion of the unit tests: this reads the payload the way a GUI
+/// would, and checks that what it can draw agrees with what the terminal printed
+/// for the identical fixture.
+#[cfg(target_os = "linux")]
+#[test]
+fn list_json_carries_the_resolution_the_terminal_prints() {
+    let sandbox = Sandbox::new("chain-json");
+    let _lock = install_sandbox(&sandbox);
+    seeded_conflict(&sandbox);
+
+    let json: serde_json::Value =
+        serde_json::from_str(&stdout(&run(&sandbox, &["list", "--json"]))).unwrap();
+    let scheme = &json["scheme"];
+    let rows: Vec<(String, String, Vec<String>)> = scheme["declarations"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|d| {
+            (
+                d["section"].as_str().unwrap().to_string(),
+                d["source"].as_str().unwrap().to_string(),
+                d["ids"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .map(|i| i.as_str().unwrap().to_string())
+                    .collect(),
+            )
+        })
+        .collect();
+    let mimeapps = sandbox.mimeapps().display().to_string();
+    assert_eq!(
+        rows,
+        vec![
+            (
+                "Default Applications".to_string(),
+                mimeapps.clone(),
+                vec!["nxmproxy.desktop".to_string()]
+            ),
+            (
+                "Added Associations".to_string(),
+                mimeapps,
+                vec!["gamemodmanager-nxm.desktop".to_string()]
+            ),
+        ],
+        "every declaration, in precedence order, with its group and its file"
+    );
+    assert_eq!(
+        scheme["rule"], "[Default Applications] outranks [Added Associations]",
+        "a GUI has to be able to show *why*, not only who"
+    );
+    assert_eq!(json["handler"], "nxmproxy.desktop");
+    assert_eq!(json["owns_scheme"], true);
+
+    // The verdict, the chain and the terminal must be one answer. A GUI that
+    // rendered `owns_scheme` next to anything else could show a working install
+    // over one that routes nothing, which is the whole failure.
+    let tested = stdout(&run(&sandbox, &["test"]));
+    for id in ["nxmproxy.desktop", "gamemodmanager-nxm.desktop"] {
+        assert!(
+            tested.contains(id) && rows.iter().any(|(_, _, ids)| ids.contains(&id.to_string())),
+            "{id} is in one answer and not the other:\n{tested}\n{rows:?}"
+        );
+    }
+
+    // And the losing case, which is the one a GUI would get wrong: the payload
+    // for a machine where nxmproxy is published and bypassed must say so in the
+    // same structure rather than going quiet.
+    std::fs::write(
+        sandbox.mimeapps(),
+        "[Added Associations]\nx-scheme-handler/nxm=nxmproxy.desktop;\n\n\
+         [Default Applications]\nx-scheme-handler/nxm=gamemodmanager-nxm.desktop;\n",
+    )
+    .unwrap();
+    let json: serde_json::Value =
+        serde_json::from_str(&stdout(&run(&sandbox, &["list", "--json"]))).unwrap();
+    assert_eq!(json["owns_scheme"], false);
+    assert_eq!(json["handler"], "gamemodmanager-nxm.desktop");
+    assert_eq!(
+        json["scheme"]["declarations"]
+            .as_array()
+            .unwrap()
+            .first()
+            .unwrap()["ids"][0],
+        "gamemodmanager-nxm.desktop",
+        "the first declaration is the winner, so a GUI cannot pick the wrong row"
+    );
+}
+
 /// The design question, made into a test: does nxmproxy find a manager it can
 /// prove is installed, and refuse to invent one it cannot?
 ///
@@ -1322,6 +1695,155 @@ fn a_third_party_manager_that_declares_nxm_handling_is_found_and_routes() {
         "the [Desktop Entry] argv must be used; a group-blind parser registers the \
          uninstall action instead: {recorded:?}"
     );
+
+    // The same chain again, with a link that is awkward on purpose. The argv is
+    // a **vector** and the substitution happens inside one element, so neither a
+    // space nor a quote can split it - but that is a claim about the code, and
+    // this is the claim about what the *target process* received. A link with a
+    // space and a quote in it is not hypothetical here: it is the bug class that
+    // made upstream's `Command::new(command.replace("%1", url))` mangle urls.
+    std::fs::remove_file(&argv_file).unwrap();
+    let awkward = r#"nxm://helldivers2/mods/9/files/8?title=a b"c&d='e'"#;
+    let delivered = run(&sandbox, &["url", awkward]);
+    assert_eq!(code(&delivered), 0, "{}", stderr(&delivered));
+    assert!(
+        wait_for(&argv_file, "DONE", Duration::from_secs(10)),
+        "the manager never ran for the awkward link: {}",
+        std::fs::read_to_string(&argv_file).unwrap_or_default()
+    );
+    let recorded = std::fs::read_to_string(&argv_file).unwrap();
+    let mut lines: Vec<&str> = recorded.lines().collect();
+    assert_eq!(lines.pop(), Some("DONE"), "{recorded:?}");
+    assert_eq!(
+        lines,
+        vec!["--no-sandbox", awkward],
+        "a link with a space and a quote must arrive as exactly one argument"
+    );
+}
+
+/// The dispatch log. The one artefact that can exist at all.
+///
+/// We are launched by the OS with no terminal and we exit in milliseconds, so
+/// when a link does not arrive there is no stdout left to read and nothing to
+/// attach a bug report to. A **silent spawn failure** - the manager uninstalled,
+/// the path wrong, the file not executable - is the likeliest reason for that,
+/// and it used to leave nothing at all behind.
+///
+/// One line per event, `key=value`, quoted, on one line each: a reader greps
+/// `^spawn` and gets the exact argv, or `result=failed` and gets the OS's own
+/// words about why.
+#[cfg(unix)]
+#[test]
+fn the_log_records_every_dispatch_and_why_one_failed() {
+    let sandbox = Sandbox::new("dispatch-log");
+    let log = sandbox.config_dir().join("nxm.log");
+    let (recorder, argv_file) = argv_recorder(&sandbox, "apps/HD2Arsenal");
+    assert_eq!(
+        code(&run(
+            &sandbox,
+            &["register", "hd2arsenal", &recorder, "--no-sandbox", "%U"]
+        )),
+        0
+    );
+
+    // A link that arrives and is delivered.
+    let link = "nxm://helldivers2/mods/1/files/2";
+    let delivered = run(&sandbox, &["url", link]);
+    assert_eq!(code(&delivered), 0, "{}", stderr(&delivered));
+    assert!(
+        wait_for(&argv_file, "DONE", Duration::from_secs(10)),
+        "the manager never ran"
+    );
+
+    let text = std::fs::read_to_string(&log).unwrap_or_default();
+    let lines: Vec<&str> = text.lines().collect();
+
+    // 1. The link, as it arrived.
+    assert!(
+        lines
+            .iter()
+            .any(|l| l.contains(&format!("link url={link:?}"))),
+        "the link that arrived is not on record: {text}"
+    );
+    // 2. Who it resolved to, by the id the user registered.
+    assert!(
+        lines.iter().any(
+            |l| l.contains("route domain=\"helldivers2\" manager=\"hd2arsenal\" result=routed")
+        ),
+        "the resolved manager is not on record: {text}"
+    );
+    // 3. The exact argv, and 4. that the spawn took. Both on ONE line: a url with
+    //    a space in it split across two lines would be unparseable exactly when
+    //    it matters most.
+    let spawn = lines
+        .iter()
+        .find(|l| l.contains("spawn manager=\"hd2arsenal\""))
+        .unwrap_or_else(|| panic!("no spawn line for the delivered link: {text}"));
+    assert!(
+        spawn.contains(&format!("exec={recorder:?}")),
+        "the spawn did not name the program it ran: {spawn}"
+    );
+    assert!(
+        spawn.contains(&format!("argv=[\"--no-sandbox\", {link:?}]")),
+        "the exact argv, as one array on one line: {spawn}"
+    );
+    assert!(
+        spawn.contains("result=started"),
+        "a delivered link must be recorded as started: {spawn}"
+    );
+
+    // 5. The handler-ownership resolution, so a link that never reaches us at all
+    //    is diagnosable rather than guessed at. `test` asks this question and
+    //    therefore logs it.
+    run(&sandbox, &["test"]);
+    let text = std::fs::read_to_string(&log).unwrap();
+    assert!(
+        text.lines()
+            .any(|l| l.starts_with("info: scheme ") && l.contains("owns=")),
+        "who held nxm:// is not on record: {text}"
+    );
+
+    // 6. A dispatch that cannot happen. This is the silent failure: the link
+    //    arrives, the domain resolves, and the program does not exist.
+    //
+    //    Assigned explicitly, because two registered managers and no assignment
+    //    is genuinely ambiguous and is refused before the spawn - correct, and
+    //    not what this test is about.
+    let ghost = sandbox.root.join("not-installed").join("Ghost");
+    assert_eq!(
+        code(&run(
+            &sandbox,
+            &["register", "ghost", ghost.to_str().unwrap(), "--", "%1"]
+        )),
+        0
+    );
+    assert_eq!(code(&run(&sandbox, &["assign", "ghost", "ghostgame"])), 0);
+    let broken = run(&sandbox, &["url", "nxm://ghostgame/mods/1/files/2"]);
+    assert_eq!(
+        code(&broken),
+        1,
+        "an undelivered link is not a delivery: {}",
+        stderr(&broken)
+    );
+    assert!(
+        stderr(&broken).contains("could not start mod manager"),
+        "the user still gets an explanation: {}",
+        stderr(&broken)
+    );
+
+    let text = std::fs::read_to_string(&log).unwrap();
+    let failure = text
+        .lines()
+        .find(|l| l.starts_with("error: spawn manager=\"ghost\""))
+        .unwrap_or_else(|| panic!("the failed spawn is not on record: {text}"));
+    assert!(
+        failure.contains("result=failed") && failure.contains("err="),
+        "the failure must carry the OS's own words, not just a verdict: {failure}"
+    );
+    assert!(
+        failure.contains("nxm://ghostgame/mods/1/files/2"),
+        "and the link it was for, so the two records can be matched: {failure}"
+    );
 }
 
 /// Two managers that both declare nxm handling is genuinely ambiguous, and
@@ -1523,7 +2045,7 @@ fn list_json_is_machine_readable_and_declares_its_version() {
         .unwrap_or_else(|e| panic!("list --json must be valid JSON: {e}\n{}", stdout(&listed)));
 
     assert_eq!(
-        json["version"], 3,
+        json["version"], 5,
         "a GUI needs a version to refuse politely"
     );
     for key in [
@@ -1533,10 +2055,17 @@ fn list_json_is_machine_readable_and_declares_its_version() {
         "assignments",
         "known_managers",
         "declared_managers",
+        "owns_scheme",
+        "scheme",
         "warnings",
     ] {
         assert!(!json[key].is_null(), "missing key {key} in {json}");
     }
+    // `handler` is the one key that is legitimately `null` here: nothing on this
+    // machine declares the scheme. Present-but-null, not absent, so a GUI can
+    // index it without special-casing the first machine it ever ran on. The
+    // bare-machine test below is the control that it really is null.
+    assert!(json.as_object().unwrap().contains_key("handler"), "{json}");
 
     let manager = &json["managers"][0];
     assert_eq!(manager["id"], "vortex");
@@ -1581,13 +2110,22 @@ fn list_json_on_a_bare_machine_is_still_valid() {
     let listed = run(&sandbox, &["list", "--json"]);
     assert_eq!(code(&listed), 0, "{}", stderr(&listed));
     let json: serde_json::Value = serde_json::from_str(&stdout(&listed)).unwrap();
-    assert_eq!(json["version"], 3);
+    assert_eq!(json["version"], 5);
     assert_eq!(json["config_writable"], true);
     assert_eq!(json["managers"].as_array().unwrap().len(), 0);
     assert_eq!(json["assignments"].as_array().unwrap().len(), 0);
     // Present and empty, not absent: a GUI indexing this key must not have to
-    // special-case "the first machine I ran this on".
+    // special-case "the first machine I ran this on". The same is true of the
+    // scheme resolution, which on a machine that has declared nothing is empty
+    // and says so rather than being absent.
     assert!(json["declared_managers"].is_array());
+    assert_eq!(json["handler"], serde_json::Value::Null);
+    assert_eq!(json["owns_scheme"], false);
+    assert!(json["scheme"]["declarations"]
+        .as_array()
+        .unwrap()
+        .is_empty());
+    assert!(!json["scheme"]["rule"].as_str().unwrap().is_empty());
     assert!(panic_markers(&listed).is_empty(), "{}", stderr(&listed));
 }
 
@@ -2159,6 +2697,19 @@ fn list_shows_each_game_under_the_manager_that_owns_it() {
 ///
 /// One registered manager, one assigned game, nothing else on the machine:
 /// every extra line has to earn its place.
+///
+/// ```text
+/// nxm:// handler: <one line: is any of the table below reachable at all>
+/// mod managers:
+///   <id>: <exec> <args>
+///     * <game>
+/// ```
+///
+/// The handler line is the one addition, and it is a fact about this machine
+/// rather than advice: if nxmproxy does not hold `nxm://` then no assignment
+/// below is ever consulted by the desktop, and a routing table printed on its
+/// own implies a working setup. `test` is where the resolution is explained -
+/// a table is not.
 #[test]
 fn list_is_exactly_the_documented_shape() {
     let sandbox = Sandbox::new("list-shape");
@@ -2178,7 +2729,7 @@ fn list_is_exactly_the_documented_shape() {
     assert_eq!(code(&run(&sandbox, &["assign", "one", "skyrimse"])), 0);
 
     let expected = format!(
-        "config: {}\n\nmod managers:\n  one: {exe} %1\n    * skyrimse\n",
+        "config: {}\nnxm:// handler: nothing\n\nmod managers:\n  one: {exe} %1\n    * skyrimse\n",
         sandbox.config_file().display()
     );
     assert_eq!(stdout(&run(&sandbox, &["list"])), expected);

@@ -121,11 +121,141 @@ impl Claim {
 pub struct Status {
     /// True when nxmproxy is registered as a possible handler.
     pub registered: bool,
-    /// What the OS reports as the current handler, or `None` when nothing
-    /// claims the scheme and the OS will ask the user.
-    pub handler: Option<String>,
     /// A note about what could not be determined here, if anything.
     pub caveat: Option<String>,
+}
+
+/// One place the OS was told `nxm://` is handled, and by whom.
+///
+/// The file and the group name are the whole point of this type. `nxmproxy test`
+/// used to print a bare application name, and on the machine that prompted all
+/// of this the scheme was declared **twice by two different applications**, so
+/// a name with nothing behind it could not be checked by hand and was not
+/// enough to act on. "gamemodmanager-nxm.desktop" does not say whether it came
+/// from `[Added Associations]` (this app says it handles nxm) or from
+/// `[Default Applications]` (this app is what the desktop opens), and those two
+/// have opposite precedence.
+///
+/// Serialised straight into `list --json`, so the contract a GUI reads is this
+/// structure and not a hand-written summary of it.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct Declaration {
+    /// The file it came from: a path on unix, a registry key on Windows. Never
+    /// invented - a declaration we cannot point at is not one we can explain.
+    pub source: String,
+    /// The group it came from, spelled as the specification spells it.
+    pub section: String,
+    /// The desktop file ids listed there, in the order the file lists them.
+    /// The **first** one is the handler; the rest are fallbacks the desktop may
+    /// offer.
+    pub ids: Vec<String>,
+}
+
+/// Every declaration the OS could have been given, in precedence order.
+///
+/// `declarations[0]` is the winner when the list is not empty; that is the
+/// ordering rule of `mimeapps.list` (first file that names the scheme decides,
+/// and within a file `[Default Applications]` before `[Added Associations]`).
+/// It is a property of the *order*, so it is stored once rather than as a
+/// separate field that could disagree with it.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct Resolution {
+    /// Where the OS was told, highest precedence first. Empty when nothing on
+    /// this machine declares the scheme.
+    pub declarations: Vec<Declaration>,
+    /// Why the winner won, in the specification's own terms.
+    pub rule: String,
+    /// False when the platform **cannot answer**, as opposed to answering "no".
+    ///
+    /// The two are not the same and reporting one as the other is a lie in the
+    /// direction that reads best: on macOS nothing here can read LaunchServices'
+    /// answer without a GUI session, so an empty [`Self::declarations`] means
+    /// "I do not know", and printing "nothing claims nxm://" there would be a
+    /// confident wrong sentence about a machine that has very probably got an
+    /// owner. Linux and Windows answer, so theirs is always true and an empty
+    /// list really does mean nothing claims it.
+    pub readable: bool,
+}
+
+impl Resolution {
+    /// The declaration the OS would use, if any.
+    pub fn winner(&self) -> Option<&Declaration> {
+        self.declarations.first()
+    }
+
+    /// The ranked ids of the winner: `foo.desktop;bar.desktop` and friends.
+    ///
+    /// Blank entries are dropped, because a `key=;` value names no application
+    /// and must not become a handler of `";"`. The raw ids are still in
+    /// [`Resolution::declarations`]; this is the list the desktop acts on.
+    pub fn handler(&self) -> Option<String> {
+        let ids: Vec<&str> = self
+            .winner()?
+            .ids
+            .iter()
+            .map(|id| id.trim())
+            .filter(|id| !id.is_empty())
+            .collect();
+        (!ids.is_empty()).then(|| ids.join(";"))
+    }
+
+    /// The one application that actually gets the link.
+    ///
+    /// **The first id, not the whole list.** A `[Default Applications]` value is
+    /// a ranked list of applications the desktop may offer, and the first entry
+    /// is the one it opens - so `vortex.desktop;nxmproxy.desktop` means Vortex
+    /// handles it and nxmproxy is merely a fallback. Comparing the joined
+    /// string against `OWN_ID` would call that a win, which is the same false
+    /// green in a new place.
+    ///
+    /// Empty list elements are skipped, because the trailing `;` the
+    /// specification writes produces one and `xdg-mime` omits it.
+    pub fn first_id(&self) -> Option<&str> {
+        self.winner()?
+            .ids
+            .iter()
+            .map(|id| id.trim())
+            .find(|id| !id.is_empty())
+    }
+
+    /// Every application that claims the scheme, deduplicated, in precedence
+    /// order.
+    ///
+    /// More than one is a genuine contest - two different programs each told the
+    /// desktop they handle `nxm://` - and it is the state a user cannot
+    /// interpret from an application name alone.
+    pub fn claimants(&self) -> Vec<&str> {
+        let mut seen: Vec<&str> = Vec::new();
+        for declaration in &self.declarations {
+            if let Some(id) = declaration
+                .ids
+                .iter()
+                .map(|id| id.trim())
+                .find(|id| !id.is_empty())
+            {
+                if !seen.contains(&id) {
+                    seen.push(id);
+                }
+            }
+        }
+        seen
+    }
+
+    /// Does the OS's own answer name **nxmproxy**?
+    ///
+    /// `registered` and "is the handler" are different facts, and this fork used
+    /// to let the first stand in for the second: `test` printed
+    /// `registered: true` next to `nxm:// handler: gamemodmanager-nxm.desktop`,
+    /// which reads as "you are fine" while nxmproxy is bypassed entirely, and
+    /// it exited 0. `install`, `test` and `list --json` now all read this one.
+    ///
+    /// Per platform because the answer is: Linux and macOS compare an
+    /// application id, Windows stores a whole command line under the bare scheme
+    /// key and cannot be reduced to one, and macOS cannot read the answer back
+    /// at all. Those are different facts, not one rule written three times.
+    pub fn owns(&self) -> bool {
+        imp::owns(self)
+    }
 }
 
 #[cfg(test)]
@@ -170,5 +300,130 @@ mod tests {
         assert_ne!(EXIT_NEEDS_USER, EXIT_FAILED);
         assert_ne!(EXIT_NEEDS_USER, EXIT_OK);
         assert_ne!(EXIT_NEEDS_USER, 2, "2 is clap's usage-error code");
+    }
+
+    /// The false green this module exists to prevent, asserted in every shape
+    /// the OS can hand back.
+    ///
+    /// Pure, and built by hand rather than read from a file: the rule is about
+    /// *which declaration wins* and *which id in it counts*, and those two are
+    /// separately falsifiable. A test that only ever ran against the real
+    /// `mimeapps.list` chain could not tell a broken [`Resolution::first_id`]
+    /// from a broken ordering.
+    fn resolution_of(declarations: Vec<(&str, &str, &str)>) -> Resolution {
+        Resolution {
+            declarations: declarations
+                .into_iter()
+                .map(|(source, section, ids)| Declaration {
+                    source: source.to_string(),
+                    section: section.to_string(),
+                    ids: ids.split(';').map(str::to_string).collect(),
+                })
+                .collect(),
+            rule: String::new(),
+            readable: true,
+        }
+    }
+
+    #[test]
+    fn the_winner_is_the_first_declaration_and_not_a_search_for_our_own_name() {
+        // The failure the user reported, exactly: nxmproxy is named, and it is
+        // named **second** in the value the desktop opens, so it is bypassed. A
+        // reader that looks for its own id anywhere in the file calls this a
+        // success. The declarations are listed in the order the OS considered
+        // them, which is what a `mimeapps.list` is parsed into.
+        let resolution = resolution_of(vec![
+            (
+                "/etc/mimeapps.list",
+                "Default Applications",
+                "gamemodmanager-nxm.desktop;nxmproxy.desktop",
+            ),
+            ("/etc/mimeapps.list", "Added Associations", "vortex.desktop"),
+        ]);
+        assert_eq!(resolution.first_id(), Some("gamemodmanager-nxm.desktop"));
+        assert_eq!(
+            resolution.handler().as_deref(),
+            Some("gamemodmanager-nxm.desktop;nxmproxy.desktop"),
+            "the whole ranked list is still what the desktop was told, nxmproxy \
+             second in it or not"
+        );
+        assert_eq!(
+            resolution.claimants(),
+            vec!["gamemodmanager-nxm.desktop", "vortex.desktop"],
+            "both applications that could get the link must be named, and a \
+             fallback in second place is not one of them"
+        );
+    }
+
+    #[test]
+    fn our_id_first_is_a_win_and_our_id_alone_is_too() {
+        let first = resolution_of(vec![(
+            "/home/u/.config/mimeapps.list",
+            "Default Applications",
+            "nxmproxy.desktop;gamemodmanager-nxm.desktop",
+        )]);
+        assert_eq!(first.first_id(), Some("nxmproxy.desktop"));
+
+        let alone = resolution_of(vec![(
+            "/home/u/.config/mimeapps.list",
+            "Default Applications",
+            "nxmproxy.desktop",
+        )]);
+        assert_eq!(alone.first_id(), Some("nxmproxy.desktop"));
+    }
+
+    #[test]
+    fn whitespace_and_empty_entries_do_not_change_which_id_wins() {
+        // The specification's trailing `;` produces an empty element, and
+        // `xdg-mime` omits the `;` entirely; a hand-edited file has spaces.
+        let resolution = resolution_of(vec![(
+            "/home/u/.config/mimeapps.list",
+            "Default Applications",
+            " nxmproxy.desktop ;other.desktop",
+        )]);
+        assert_eq!(resolution.first_id(), Some("nxmproxy.desktop"));
+
+        // A value that is nothing but separators names no application at all.
+        for empty in ["", "   ", ";"] {
+            let blank = resolution_of(vec![(
+                "/home/u/.config/mimeapps.list",
+                "Default Applications",
+                empty,
+            )]);
+            assert_eq!(blank.first_id(), None, "{empty:?} named nobody");
+            assert_eq!(blank.handler(), None, "{empty:?} produced a handler");
+            assert!(blank.claimants().is_empty(), "{empty:?} claimed the scheme");
+        }
+    }
+
+    #[test]
+    fn no_declaration_means_no_handler_rather_than_ours_by_default() {
+        // Nothing claims it: the desktop will ask, and the answer is not ours.
+        let resolution = Resolution {
+            declarations: Vec::new(),
+            rule: String::new(),
+            readable: true,
+        };
+        assert_eq!(resolution.first_id(), None);
+        assert_eq!(resolution.handler(), None);
+        assert_eq!(resolution.winner(), None);
+        assert!(resolution.claimants().is_empty());
+    }
+
+    #[test]
+    fn one_application_listed_twice_is_not_a_contest() {
+        // The same id in two sections is one application asserting itself twice,
+        // which is what `xdg-mime default` and a desktop entry both produce. It
+        // is not "two applications declare nxm://".
+        let resolution = resolution_of(vec![
+            (
+                "/a",
+                "Default Applications",
+                "nxmproxy.desktop;other.desktop",
+            ),
+            ("/a", "Added Associations", "nxmproxy.desktop"),
+            ("/b", "Default Applications", "nxmproxy.desktop"),
+        ]);
+        assert_eq!(resolution.claimants(), vec!["nxmproxy.desktop"]);
     }
 }
