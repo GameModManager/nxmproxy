@@ -13,15 +13,19 @@
 //! `lsregister` instead, which makes the bundle *eligible*. macOS then asks,
 //! or the user picks in System Settings.
 //!
-//! ## Verification status: UNCOMPILED AND UNVERIFIED
+//! ## Verification status
 //!
-//! There is no macOS SDK on the machine this was written on, so none of this
-//! has been compiled or run on macOS. What *is* verified is that this file
-//! compiles on Linux and that its plist and argument construction are unit
-//! tested, because it contains no FFI: it shells out to `lsregister` and writes
-//! text files. What is **not** verified is LaunchServices' actual behaviour:
-//! whether the chooser appears, in which order the entries are offered, and
-//! what `test` reports on a real machine.
+//! Written on a machine with no macOS SDK, so it was never run there by the
+//! author. Since added to CI it **compiles** on `aarch64-apple-darwin` and the
+//! unit tests pass on `macos-latest`: the plist text, the launcher script and
+//! the shell quoting are tested, because this file contains no FFI and only
+//! writes text files.
+//!
+//! What is **not** verified is LaunchServices' actual behaviour: whether the
+//! chooser appears, in which order the entries are offered, whether `Alternate`
+//! rank does what is intended, and what `test` reports on a machine where
+//! another manager already owns `nxm://`. That needs a real Mac and a real
+//! click.
 //!
 //! `current_handler` is honest about the gap rather than guessing. The real
 //! answer requires `LSCopyDefaultHandlerForURLScheme`, a CoreFoundation call

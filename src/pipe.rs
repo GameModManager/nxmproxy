@@ -16,6 +16,11 @@
 
 #[cfg(windows)]
 fn write_pipe(pipe: &str, value: &str) -> std::io::Result<usize> {
+    // The `Write` import is deliberately scoped to this arm. The import that
+    // existed in upstream was at file scope, where the non-Windows arm no
+    // longer needs it, and a Linux build cannot see this line at all - so a
+    // missing import here would only ever have been caught by a Windows CI run.
+    use std::io::Write;
     std::fs::File::create(format!(r"\\.\pipe\{pipe}"))?.write(value.as_bytes())
 }
 

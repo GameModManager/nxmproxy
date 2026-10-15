@@ -18,8 +18,15 @@
 //! `HOME`/XDG tree, so nothing here can reach the developer's real
 //! configuration or their real `mimeapps.list`.
 
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::process::{Command, Output};
+// `Path`, `Duration` and `Instant` are only reached by the platform-specific
+// tests below, so they are imported only where they are used. Importing them
+// unconditionally makes Windows clippy fail with "unused import" under the
+// `-D warnings` the CI runs with.
+#[cfg(any(unix, target_os = "linux"))]
+use std::path::Path;
+#[cfg(unix)]
 use std::time::{Duration, Instant};
 
 const BIN: &str = env!("CARGO_BIN_EXE_nxmproxy");
@@ -57,7 +64,9 @@ impl Sandbox {
     }
 
     /// Every file under the sandbox that is not ours, so we can prove `install`
-    /// wrote no association state anywhere.
+    /// wrote no association state anywhere. Only the Linux test needs it; on
+    /// the other platforms it would be dead code, which clippy rightly refuses.
+    #[cfg(target_os = "linux")]
     fn all_files(&self) -> Vec<PathBuf> {
         fn walk(dir: &Path, into: &mut Vec<PathBuf>) {
             let Ok(entries) = std::fs::read_dir(dir) else {
@@ -131,6 +140,7 @@ fn panic_markers(output: &Output) -> Vec<&'static str> {
 
 /// Wait, bounded, for `path` to appear. nxmproxy deliberately does not wait for
 /// the manager it spawns, so the child may land slightly after we exit.
+#[cfg(unix)]
 fn wait_for(path: &Path, budget: Duration) -> bool {
     let deadline = Instant::now() + budget;
     while Instant::now() < deadline {

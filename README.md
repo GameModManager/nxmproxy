@@ -121,10 +121,7 @@ The one other thing `install` does is run `update-desktop-database` on the
 directory, best effort, to refresh the desktop's cache of desktop files. That is
 a cache, not a record of the user's choice.
 
-### macOS — **UNCOMPILED AND UNVERIFIED**
-
-> **Honest status: there is no macOS SDK on the machine this was written on.**
-> None of the macOS path has been compiled or run on macOS. It is reviewed code.
+### macOS — compiles, but the runtime behaviour is UNVERIFIED
 
 `install` publishes a minimal `.app` bundle under
 `~/Library/Application Support/nxmproxy/` with an `Info.plist` whose
@@ -141,9 +138,15 @@ reason.
 binding `LSCopyDefaultHandlerForURLScheme`. This fork does not bind it, so `test`
 says so and points at System Settings rather than inventing a boolean.
 
-What *is* verified is that the module compiles on Linux and that the plist text,
-the launcher script and the shell quoting are unit tested, because the module
-contains no FFI.
+> **Honest status.** The code was written on a machine with no macOS SDK, so it
+> was never run there by its author. What is now verified: **it compiles on
+> `aarch64-apple-darwin` and the unit tests pass on `macos-latest` in CI.**
+> What is **not** verified, and needs a real Mac and a real click: that
+> `lsregister` makes LaunchServices offer the bundle, in what order the entries
+> appear in the chooser, that the `Alternate` rank has the intended effect, and
+> what `test` reports on a machine where something else already owns `nxm://`.
+> Every one of those is a LaunchServices behaviour, and nothing here exercises
+> LaunchServices.
 
 ### Windows
 
@@ -171,8 +174,12 @@ leaves the risky part (exact key names and quoting) as plain argument vectors th
 are unit tested on every platform.
 
 > **Honest status: the Windows path has never been executed against a Windows
-> registry.** It is code-read and unit tested for its key names, its argument
-> construction and its per-user scope, but `reg.exe` itself has not been run.
+> registry.** It compiles on `x86_64-pc-windows-msvc` and its unit tests pass on
+> `windows-latest` in CI, and the key names, argument construction and per-user
+> scope are asserted by tests. What is **not** verified: that `reg.exe` accepts
+> and writes every key as intended, that Windows then offers nxmproxy in the
+> `nxm://` chooser, and that the `RegisteredApplications` entry behaves. Those
+> need a real machine and a real click.
 
 ---
 
@@ -329,13 +336,25 @@ Every CLI test runs in a throwaway config directory and a throwaway
 
 ### CI
 
-`.github/workflows/ci.yml` runs `cargo test` on **Linux, macOS and Windows**.
+`.github/workflows/ci.yml` runs `cargo fmt --check`, `clippy -D warnings`,
+`cargo build --release` and `cargo test` on **Linux, macOS and Windows**.
 
-> What the CI run on macOS and Windows does and does not prove: it proves the
-> crate **compiles** on both, and that the pure logic and the platform module
-> text are correct. It does **not** prove that `lsregister` makes macOS offer the
-> bundle, nor that `reg.exe` writes the keys we intend. Those need a real
+> **What the CI run proves on macOS and Windows, precisely:** the crate compiles
+> there, and every test that does not need a real OS passes. The unit tests for
+> the macOS plist and the Windows registry operations are pure functions over
+> text, so they run and pass on all three platforms.
+>
+> **What it does not prove:** that `lsregister` makes macOS offer the bundle, or
+> that `reg.exe` writes the Windows keys as intended. The `tests/cli.rs`
+> registration round trip runs on macOS and Windows but only exercises the
+> platform module that can actually perform the write, so on those two it
+> verifies the CLI contract rather than the OS integration. Both need a real
 > machine and a real click.
+>
+> This split is not hypothetical. The first CI run failed on both: the Windows
+> named-pipe path was missing its `io::Write` import, which no Linux build can
+> see because the function is `#[cfg(windows)]`, and would have failed to compile
+> for every Windows user.
 
 ---
 
