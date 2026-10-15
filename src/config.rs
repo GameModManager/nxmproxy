@@ -336,9 +336,8 @@ impl Config {
     pub fn assign(&mut self, manager_id: &str, domain: &str) -> Result<(), String> {
         if !self.managers.contains_key(manager_id) {
             return Err(format!(
-                "no mod manager named {:?} is registered; \
-                 register it first with: nxmproxy register {manager_id} <exec> [<args>...]",
-                manager_id
+                "no mod manager named {manager_id:?} is registered.\n  \
+                 nxmproxy register {manager_id} <exec> [<args>...]"
             ));
         }
         let domain = domain.trim().to_ascii_lowercase();

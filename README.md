@@ -99,6 +99,25 @@ only when nxmproxy really is the handler *and that was verified from this
 process*. On macOS and on Windows it cannot be, so it exits **3** and prints the
 exact click. Reporting success there is how a broken install gets automated.
 
+### Changed: the human output says the state and nothing else
+
+Upstream had no `list`, so this is not a fix to something of theirs - it is a
+rule this fork holds itself to, and the "Was" column is **this fork's own
+first version** of each line.
+
+| Was | Now | Why |
+| --- | --- | --- |
+| `gamemodmanager: /path/gm --handle-nxm %1`<br>`&nbsp;&nbsp;&nbsp;&nbsp;(registered by you; no games assigned)`, a `local bin:` inventory line with a paragraph explaining what it is not, a closing "a discovered manager routes nothing until a game is assigned to it", and a separate `games:` section | `gamemodmanager: /path/gm --handle-nxm %1`<br>`&nbsp;&nbsp;&nbsp;&nbsp;* skyrimse` | The table had four sentences of prose per manager saying things the layout already shows. A manager with no `*` line under it routes nothing; that **is** the "assigned to nothing" signal, and the parenthetical restated it. The games section restated the same assignments a second time. |
+| Provenance as a parenthetical: `(discovered - you have not chosen this one)` vs `(registered by you)` | Nothing in the human output; `managers[].discovered` in `--json` | Two of the notes explained a difference the user cannot act on differently, and the one that matters (nothing routes) was already visible as the absence of games. The flag is still in the contract, which is what a GUI reads. |
+| `discover` ended with the assignment recipe, `install`/`list` ended with "run this other command", `test` annotated `none` with what the OS would do about it | The command that changed something, or the state that resulted | A user has `--help`. Repeating the recipe after every command meant reading the same three lines to find the one line that was news. |
+
+`local bin:` went entirely rather than being shortened: nothing in it is
+actionable, and it was never a detection source.
+
+The one command still printed is `nxmproxy register <id> <exec> <args>` beside a
+detected candidate. That is not advice - it is this machine's own path and argv,
+which exist in no file the user has to go and read.
+
 ### The rule all three platforms obey: ask, then say whether it worked
 
 | Platform | Can it claim? | How | What `install` reports |
@@ -508,6 +527,24 @@ by declaration.
 | `pipe <manager> <pipe>` | Give a manager a named pipe to try before spawning it. |
 | `url <nxm url>` | Forward a link. This is what the OS invokes. |
 
+`list` prints the routing table and nothing else:
+
+```
+mod managers:
+  gamemodmanager: /usr/bin/gamemodmanager --handle-nxm %1
+  vortex: /opt/vortex/Vortex %1
+    * skyrimse
+    * fallout4
+```
+
+A `* <game>` line, one tab in, for every game assigned to that manager. **A
+manager with no `*` line under it is assigned nothing and routes nothing** -
+which is why there is no "discovered" or "not chosen" marker next to it.
+`every unassigned game` is the `_` catch-all. A trailing note says what the
+command line cannot: `(unavailable)` when the executable is not on this machine,
+`(no link code)` when the argv has no `%1`/`%u`/`%U`, and the pipe name when one
+is set.
+
 ### The link field code: `%1`, `%u`, `%U`
 
 Inside any argument, the place the link goes is marked with `%1`, `%u` or
@@ -851,12 +888,25 @@ red. The controls are mutation-and-observe, not assertion-counting:
 | 20 | `register` no longer clears the `discovered` flag | `registering_a_discovered_manager_by_hand_makes_it_a_choice` |
 | 21 | load keeps a `discovered` id whose manager failed validation | `a_stale_discovered_id_is_dropped_on_load` |
 | 22 | `list` reverts to "executable not found on this machine" | `an_uninstalled_application_is_marked_unavailable_and_not_forgotten` |
-| 23 | `list` stops printing where each manager came from | `list_tells_discovered_registered_and_assigned_apart` |
+| 23 | `list` stops printing where each manager came from | `list_shows_each_game_under_the_manager_that_owns_it` |
 | 24 | `install` runs discovery itself | `install_never_writes_a_discovered_manager_on_its_own` |
 | 25 | `discover` also assigns the catch-all to what it found | `discover_remembers_the_real_arsenal_entry_and_assigns_it_nothing`, `a_remembered_manager_never_routes_a_link_the_user_did_not_ask_for` |
 | 26 | `declared_candidates` accepts an `Exec` that does not resolve | `discover_keeps_every_candidate_and_stores_nothing_it_can_be_start` |
 | 27 | a re-scan claims "remembered" when it remembered nothing | `a_rescan_does_not_clobber_a_registered_manager_or_an_assignment` |
 | 28 | the Arsenal fixture is tidied - the duplicate scheme, or the `MimeType` moved into `[Desktop Entry]` | `the_arsenal_fixture_is_still_the_file_a_user_has` |
+| 29 | the `local bin:` inventory line is printed by `list` again | `list_is_exactly_the_documented_shape`, `no_command_prints_lesson_text` |
+| 30 | `test` annotates `nxm:// handler: none` with what the OS will do about it | `no_command_prints_lesson_text` |
+| 31 | `discover` ends with the assignment recipe again | `no_command_prints_lesson_text` |
+| 32 | the `* <game>` line loses its tab, so a game sits at the same indent as its manager | `list_is_exactly_the_documented_shape`, `list_shows_each_game_under_the_manager_that_owns_it` |
+
+Controls 29-32 are the ones that matter for the output-shape rules, and all four
+were run before this table was written. 29, 30 and 31 each came back **red on
+the first attempt**, quoting the sentence that had come back; 32 came back red
+with the `left` and `right` blocks showing the two-space line against the
+four-space one. 29 and 32 fail **two** tests each, deliberately: one compares
+the whole stream and cannot pass on prose nobody wrote an assertion for, the
+other reads the per-manager block and cannot pass on a shape change. Neither
+test alone would have caught both kinds.
 
 One control is deliberately reported as **green**, and that is the point of
 running them at all. Breaking `Claim::exit_code` to always return 0 did **not**
@@ -908,7 +958,7 @@ The rest found real bugs while they were being written:
 
 `unclaim` does its own per-id filtering to decide which other managers survive on
 the `[Default Applications]` line, and **that filter has no test**. Breaking it
-so it keeps nothing leaves all 119 tests green, because the `uninstall` fixtures
+so it keeps nothing leaves all 121 tests green, because the `uninstall` fixtures
 never put a second manager on the same `[Default Applications]` nxm key - the
 shared-key case is only exercised one level down, against `set_default_ids`
 directly, which is not the code path `unclaim` uses. Reaching it needs a

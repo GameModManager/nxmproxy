@@ -33,26 +33,26 @@ pub enum Reason {
 }
 
 impl Reason {
-    /// A message that tells the user what to type next.
+    /// The fact, plus the one command that changes it.
+    ///
+    /// One remedy line, not three: the `_` catch-all and the "what should
+    /// happen instead" commentary are in `assign --help`, and a user reading
+    /// this has a browser waiting on them.
     pub fn message(&self, domain: &str) -> String {
         match self {
             Reason::NoManagers => format!(
-                "no mod managers are registered, so there is nothing to forward the nxm link for \
-                 {domain:?} to.\n  register one:  nxmproxy register <name> <exec> [<args>...]"
+                "no mod manager is registered, so nothing can forward {domain:?}.\n  \
+                 nxmproxy register <name> <exec> [<args>...]"
             ),
             Reason::Ambiguous(ids) => format!(
-                "no mod manager is assigned to the nxm domain {domain:?}, and {} managers are \
-                 registered ({}) so guessing would deliver the link to the wrong one.\n  assign one:  \
-                 nxmproxy assign <name> {domain}\n  or send every unassigned game to one of them:  \
-                 nxmproxy assign <name> _",
+                "{domain:?} is assigned to none of the {} registered mod managers ({}).\n  \
+                 nxmproxy assign <name> {domain}",
                 ids.len(),
                 ids.join(", ")
             ),
             Reason::Unassigned(ids) => format!(
-                "the {} mod manager(s) nxmproxy knows about ({}) were all found by discovery, and \
-                 you have not chosen one, so nxmproxy will not deliver the link for {domain:?} to \
-                 an application you did not pick.\n  assign one:  nxmproxy assign <name> {domain}\n  \
-                 or send every unassigned game to one of them:  nxmproxy assign <name> _",
+                "the {} known mod manager(s) ({}) were all found by discovery and none is chosen, \
+                 so {domain:?} is not forwarded.\n  nxmproxy assign <name> {domain}",
                 ids.len(),
                 ids.join(", ")
             ),
@@ -374,7 +374,7 @@ mod tests {
                 let message = ids_message(&config, "helldivers2");
                 assert!(message.contains("assign"), "{message}");
                 assert!(
-                    message.contains("did not pick"),
+                    message.contains("found by discovery"),
                     "the message must say why it refuses: {message}"
                 );
             }

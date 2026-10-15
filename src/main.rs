@@ -647,43 +647,33 @@ fn unusable_declarations() -> Vec<String> {
         .collect()
 }
 
-/// Print what this machine has, and the command to use it.
+/// Print what this machine has, and the command that registers each one.
 ///
 /// A candidate list and a choice, never a choice made for the user: routing an
 /// nxm link into the wrong mod manager puts a download in somebody else's
 /// queue, which is worse than not routing it at all.
+///
+/// The register command is the one command worth printing. It is not advice -
+/// it is this machine's own path and argv, which exist nowhere else and which
+/// `xdg-mime`/a desktop-entry file would otherwise take a human to reconstruct.
+/// Every *other* command is in `--help`, where it belongs.
 fn print_candidates(candidates: &[Candidate]) {
     let refused = unusable_declarations();
     if candidates.is_empty() {
-        println!(
-            "\nnxmproxy handles nxm://, but there is no mod manager to forward to, so a\n\
-                  link would arrive and go nowhere. Add one now:\n\n    \
-                  nxmproxy register gamemodmanager gamemodmanager -- --handle-nxm %1\n\n\
-                  `nxmproxy list --json` lists the managers it can find on this machine."
-        );
+        println!("no mod manager registered, and none found on this machine.");
         print_refused(&refused);
         return;
     }
 
     let count = candidates.len();
     println!(
-        "\n{count} application{} on this machine {} nxm:// links:",
+        "{count} application{} on this machine {} nxm://:",
         if count == 1 { "" } else { "s" },
         if count == 1 { "declares" } else { "declare" }
     );
-    if count > 1 {
-        println!("nxmproxy will not choose between them for you. Register the one you want:");
-    }
     for candidate in candidates {
-        println!("\n  {}", candidate.name);
         println!("    {}", register_command(candidate));
     }
-    if count > 1 {
-        println!("\nthen pick who owns which game:\n\n    nxmproxy assign <name> <game>");
-        println!("or send every unassigned game to one of them:\n    nxmproxy assign <name> _");
-    }
-    println!("\nor remember them all at once, assigned to nothing:\n    nxmproxy discover");
-
     print_refused(&refused);
 }
 
@@ -696,11 +686,7 @@ fn print_refused(refused: &[String]) {
     if refused.is_empty() {
         return;
     }
-    println!(
-        "\nskipped {} application{} that declared nxm:// handling but nxmproxy cannot start:",
-        refused.len(),
-        if refused.len() == 1 { "" } else { "s" }
-    );
+    println!("unusable:");
     for line in refused {
         println!("  {line}");
     }
@@ -747,10 +733,7 @@ fn discover_managers(config: &mut Config) -> Vec<String> {
 fn handle_discover(config: &mut Config, save: &dyn Fn(&Config) -> i32) -> i32 {
     let found = declared_candidates();
     if found.is_empty() {
-        println!(
-            "No mod manager on this machine declares x-scheme-handler/nxm, so there is nothing \
-             to remember.\nAdd one by hand:  nxmproxy register <name> <exec> [<args>...]"
-        );
+        println!("nothing on this machine declares x-scheme-handler/nxm.");
         print_refused(&unusable_declarations());
         return 0;
     }
@@ -761,70 +744,27 @@ fn handle_discover(config: &mut Config, save: &dyn Fn(&Config) -> i32) -> i32 {
         return code;
     }
 
+    // What was found, and nothing else. What a user does about it is in `--help`;
+    // repeating the assignment recipe here was three commands of lecture per run.
     if added.is_empty() {
         println!(
-            "{} mod manager{} on this machine {} already known. Nothing changed.",
+            "{} mod manager{} already known.",
             found.len(),
-            if found.len() == 1 { "" } else { "s" },
-            if found.len() == 1 { "is" } else { "are" }
+            if found.len() == 1 { "" } else { "s" }
         );
     } else {
         println!(
-            "Found {} mod manager{}:",
+            "found {} mod manager{}:",
             found.len(),
             if found.len() == 1 { "" } else { "s" }
         );
         for line in &added {
             println!("  {line}");
         }
-
-        // The whole point of the feature, stated plainly rather than left for
-        // the user to discover by clicking a link that goes nowhere. Only when
-        // something was actually remembered: saying "remembered" after adding
-        // nothing is a sentence that is simply false.
-        println!("\nRemembered, but assigned to no game. Nothing routes until you say so:");
-        println!("    nxmproxy assign <name> <game>");
-        println!("or send every game with no assignment to one of them:");
-        println!("    nxmproxy assign <name> _");
-        println!("\n`nxmproxy list` shows what was found and what you have chosen.");
     }
 
     print_refused(&unusable_declarations());
     0
-}
-
-/// Where the per-user executable directory is, and what it is for.
-///
-/// Reported because it is the usual answer to "where did the name in that
-/// `Exec=` line go", and because installer-managed apps drop a symlink there
-/// for every app they own. Never a detection source: what is in it says a
-/// program runs, not that it takes an nxm link.
-fn print_local_bin() {
-    let Some(bin) = xdg::local_bin() else {
-        return;
-    };
-    if !bin.is_dir() {
-        return;
-    }
-    let Ok(entries) = std::fs::read_dir(&bin) else {
-        return;
-    };
-    let mut total = 0;
-    let mut symlinks = 0;
-    for entry in entries.flatten() {
-        total += 1;
-        if entry.path().is_symlink() {
-            symlinks += 1;
-        }
-    }
-    if total == 0 {
-        return;
-    }
-    println!(
-        "local bin: {} ({total} entries, {symlinks} symlinks) - where installer-managed apps \
-         point their names at, not a detection source",
-        bin.display()
-    );
 }
 
 /// The games assigned to `id`, as the `list` table shows them.
@@ -835,7 +775,7 @@ fn games_of(config: &Config, id: &str) -> Vec<String> {
         .filter(|(_, assigned)| assigned.as_str() == id)
         .map(|(domain, _)| {
             if domain == config::CATCH_ALL {
-                "_ (every unassigned game)".to_string()
+                "every unassigned game".to_string()
             } else {
                 domain.clone()
             }
@@ -843,85 +783,61 @@ fn games_of(config: &Config, id: &str) -> Vec<String> {
         .collect()
 }
 
+/// The routing table, in the shape the README documents:
+///
+/// ```text
+/// mod managers:
+///   <id>: <exec> <args>
+///     * <game>
+/// ```
+///
+/// Nothing else. A manager with no `*` line under it routes nothing, which
+/// says "assigned to nothing" without a parenthetical saying so - and saying it
+/// in prose is what this function used to do, four sentences per manager.
+///
+/// Provenance is not shown either: `discovered` is still in `list --json`, and a
+/// manager found by the back door with no games under it is self-evident.
 fn print_list(config: &Config, loaded: &config::Loaded, dir: &Path) {
     println!("config: {}", dir.join(config::CONFIG_FILE).display());
     for warning in &loaded.warnings {
         eprintln!("warning: {warning}");
     }
-    print_local_bin();
 
     if config.managers.is_empty() {
-        println!("\nno mod managers registered.");
+        println!();
         print_candidates(&detect_candidates());
         return;
     }
 
     println!("\nmod managers:");
     for (id, manager) in &config.managers {
-        let discovered = config.discovered.contains(id);
-        let mut notes: Vec<String> = vec![if discovered {
-            "discovered - you have not chosen this one".to_string()
-        } else {
-            "registered by you".to_string()
-        }];
+        let command = std::iter::once(manager.exec.as_str())
+            .chain(manager.args.iter().map(String::as_str))
+            .collect::<Vec<_>>()
+            .join(" ");
 
-        let games = games_of(config, id);
-        notes.push(if games.is_empty() {
-            "no games assigned".to_string()
-        } else {
-            format!("games: {}", games.join(", "))
-        });
-
+        // Only what the command itself does not already say. A file going
+        // missing is the commonest way a list silently loses an entry, so that
+        // one stays.
+        let mut notes: Vec<String> = Vec::new();
         if !manager.takes_url() {
-            notes.push("no %1, %u or %U in its arguments, it would receive no link".to_string());
+            notes.push("no link code".to_string());
         }
         if resolve_exec(&manager.exec).is_none() {
-            // Kept, not deleted. A file going missing is the commonest way a
-            // list silently loses an entry, and the user would have to find and
-            // retype the whole thing.
-            notes.push(format!(
-                "unavailable: {:?} is not on this machine, it was uninstalled",
-                manager.exec
-            ));
+            notes.push("unavailable".to_string());
         }
         if let Some(pipe) = &manager.pipe {
             notes.push(format!("pipe {pipe}"));
         }
-        println!(
-            "  {id}: {} {}\n      ({})",
-            manager.exec,
-            manager.args.join(" "),
-            notes.join("; ")
-        );
-    }
-
-    if !config.discovered.is_empty() {
-        println!(
-            "\n  a discovered manager routes nothing until a game is assigned to it. \
-             `nxmproxy list` never picks one for you."
-        );
-    }
-
-    println!("\ngames:");
-    if config.games.is_empty() {
-        let chosen = config
-            .managers
-            .iter()
-            .filter(|(id, _)| !config.discovered.contains(*id))
-            .count();
-        if chosen == 1 {
-            println!("  none - every game goes to the only mod manager you registered");
+        let notes = if notes.is_empty() {
+            String::new()
         } else {
-            println!("  none - no game is routed to anything, because no game has been assigned");
-        }
-    } else {
-        for (domain, manager) in &config.games {
-            let label = if domain == config::CATCH_ALL {
-                "_ (every unassigned game)"
-            } else {
-                domain.as_str()
-            };
-            println!("  {label} -> {manager}");
+            format!(" ({})", notes.join(", "))
+        };
+
+        println!("  {id}: {command}{notes}");
+        for game in games_of(config, id) {
+            println!("    * {game}");
         }
     }
 }
@@ -967,9 +883,11 @@ fn handle_test() -> i32 {
         },
         handler: platform::imp::current_handler().unwrap_or(None),
         caveat: if cfg!(target_os = "macos") {
-            Some("the default handler cannot be read without LSCopyDefaultHandlerForURLScheme, \
-                  which this fork does not bind; check System Settings > General > Login Items & Extensions"
-                .to_string())
+            Some(
+                "the default handler cannot be read on macOS; check System Settings > General \
+                  > Login Items & Extensions"
+                    .to_string(),
+            )
         } else {
             None
         },
@@ -978,7 +896,7 @@ fn handle_test() -> i32 {
     println!("registered: {}", status.registered);
     match &status.handler {
         Some(handler) => println!("nxm:// handler: {handler}"),
-        None => println!("nxm:// handler: (none - the OS will ask you which app to use)"),
+        None => println!("nxm:// handler: none"),
     }
     if let Some(caveat) = &status.caveat {
         println!("note: {caveat}");
@@ -1028,10 +946,9 @@ fn handle_install(config: &mut Config, save: &dyn Fn(&Config) -> i32) -> i32 {
                             code = saved;
                         }
                         println!(
-                    "Found {} on this machine and registered it as {}. Every game routes to \
-                     it until you `assign` something else.",
-                    candidate.name, candidate.id
-                );
+                            "registered {} as {}; every game routes to it.",
+                            candidate.name, candidate.id
+                        );
                     }
                     Err(message) => {
                         // Not fatal, and not a claim failure either: the scheme is
@@ -1175,7 +1092,7 @@ fn run() -> i32 {
                 if !config.managers[&name].takes_url() {
                     eprintln!(
                         "warning: {name:?} has no %1, %u or %U in its arguments, so it will be \
-                         started but given no link. Re-run with the link code in the right position."
+                         started but given no link."
                     );
                 }
                 if resolve_exec(&config.managers[&name].exec).is_none() {

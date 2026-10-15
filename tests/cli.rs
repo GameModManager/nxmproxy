@@ -948,8 +948,8 @@ fn install_and_uninstall_round_trip() {
         stderr(&installed)
     );
     assert!(
-        stdout(&installed).contains("nxmproxy register"),
-        "install must name the command to run: {}",
+        stdout(&installed).contains("no mod manager registered, and none found"),
+        "install must say it has nothing to route to: {}",
         stdout(&installed)
     );
 
@@ -1938,20 +1938,24 @@ fn an_uninstalled_application_is_marked_unavailable_and_not_forgotten() {
         "it vanished from the listing:\n{out}"
     );
     assert!(
-        out.contains("unavailable") && out.contains("uninstalled"),
+        out.contains("unavailable"),
         "the listing must say what happened, not just drop it:\n{out}"
     );
+    // And only that one. The note sits on the manager's own line, so the
+    // manager that is still installed can be checked for its absence directly.
+    let still_there = out
+        .lines()
+        .find(|line| line.trim_start().starts_with("mod-two:"))
+        .unwrap_or_else(|| panic!("mod-two is missing from the listing:\n{out}"));
     assert!(
-        out.contains("discovered"),
-        "and it must still read as found, not chosen:\n{out}"
-    );
-    assert!(
-        !out.contains(&format!("unavailable: {other}")),
+        !still_there.contains("unavailable"),
         "the manager that is still installed was marked unavailable:\n{out}"
     );
 
     // The JSON contract agrees with the table, which is the disagreement that
-    // makes a diagnostic useless.
+    // makes a diagnostic useless. It is also where "found, not chosen" now
+    // lives: the human table dropped that prose, so the flag is the only place
+    // left that can say it.
     let json: serde_json::Value =
         serde_json::from_str(&stdout(&run(&sandbox, &["list", "--json"]))).unwrap();
     let by_id = |id: &str| -> serde_json::Value {
@@ -2025,10 +2029,15 @@ fn registering_a_discovered_manager_by_hand_makes_it_a_choice() {
 }
 
 /// `list` is how a user tells what nxmproxy found from what they chose, so it
-/// has to say which is which and who is routed where.
+/// has to say who is routed where, in the documented shape.
+///
+/// Provenance moved: the human table no longer says "discovered" or "registered
+/// by you", because no `*` line under a manager says the same thing more
+/// cheaply and the JSON carries the flag. What the table must still do is put
+/// each game under the manager that owns it, one `* ` line, one tab in.
 #[cfg(target_os = "linux")]
 #[test]
-fn list_tells_discovered_registered_and_assigned_apart() {
+fn list_shows_each_game_under_the_manager_that_owns_it() {
     let sandbox = Sandbox::new("discover-list");
     let apps = sandbox.data_applications();
     std::fs::create_dir_all(&apps).unwrap();
@@ -2036,7 +2045,8 @@ fn list_tells_discovered_registered_and_assigned_apart() {
     std::fs::write(apps.join("HD2Arsenal.desktop"), arsenal_fixture(&recorder)).unwrap();
 
     // One the user registered and assigned. One nxmproxy found. One nxmproxy
-    // found and the user then assigned - both, not either.
+    // found and the user then assigned - both, not either. One registered and
+    // left alone.
     assert_eq!(
         code(&run(
             &sandbox,
@@ -2059,11 +2069,54 @@ fn list_tells_discovered_registered_and_assigned_apart() {
     );
 
     let out = stdout(&run(&sandbox, &["list"]));
-    assert!(out.contains("skyrimse -> vortex"), "{out}");
-    assert!(out.contains("helldivers2 -> hd2arsenal"), "{out}");
 
-    // Provenance, per manager. A GUI reads the JSON for this, and the table has
-    // to agree with it.
+    // The shape, exactly: the game is a `* ` line under its own manager, one tab
+    // in, and nowhere else. Checking the whole block is what makes a stray
+    // `games:` section or a `domain -> manager` line fail.
+    let block = |id: &str| -> Vec<String> {
+        let lines: Vec<&str> = out.lines().collect();
+        let start = lines
+            .iter()
+            .position(|l| l.starts_with(&format!("  {id}: ")))
+            .unwrap_or_else(|| panic!("{id} is missing from the listing:\n{out}"));
+        let tail = &lines[start + 1..];
+        let end = tail
+            .iter()
+            .position(|l| !l.starts_with("    "))
+            .unwrap_or(tail.len());
+        std::iter::once(lines[start])
+            .chain(tail[..end].iter().copied())
+            .map(str::to_string)
+            .collect()
+    };
+
+    assert_eq!(
+        block("hd2arsenal"),
+        vec![
+            format!("  hd2arsenal: {recorder} --no-sandbox %1"),
+            "    * helldivers2".to_string()
+        ],
+        "{out}"
+    );
+    // `/opt/vortex` and `/opt/mo2` do not exist, so each carries the one note
+    // the command line cannot say for itself.
+    assert_eq!(
+        block("vortex"),
+        vec![
+            "  vortex: /opt/vortex/Vortex %1 (unavailable)".to_string(),
+            "    * skyrimse".to_string()
+        ],
+        "{out}"
+    );
+    // A manager with no games shows the command and nothing else. That absence
+    // IS the "routes nothing" signal; a parenthetical saying so was cut.
+    assert_eq!(
+        block("mo2"),
+        vec!["  mo2: /opt/mo2/MO2Launcher %1 (unavailable)".to_string()],
+        "{out}"
+    );
+
+    // Provenance is the JSON's job now, and it must still be there for a GUI.
     let json: serde_json::Value =
         serde_json::from_str(&stdout(&run(&sandbox, &["list", "--json"]))).unwrap();
     let by_id = |id: &str| -> serde_json::Value {
@@ -2078,17 +2131,140 @@ fn list_tells_discovered_registered_and_assigned_apart() {
     assert_eq!(by_id("hd2arsenal")["discovered"], true);
     assert_eq!(by_id("vortex")["discovered"], false);
     assert_eq!(by_id("mo2")["discovered"], false);
-    assert!(
-        out.contains("discovered - you have not chosen this one"),
-        "the table must say which managers were found:\n{out}"
+    let assignments: Vec<(&str, &str)> = json["assignments"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|a| {
+            (
+                a["domain"].as_str().unwrap(),
+                a["manager"].as_str().unwrap(),
+            )
+        })
+        .collect();
+    assert_eq!(
+        assignments,
+        vec![("helldivers2", "hd2arsenal"), ("skyrimse", "vortex")],
+        "{json}"
     );
-    assert!(
-        out.contains("registered by you"),
-        "and which were chosen:\n{out}"
+}
+
+/// The documented shape, byte for byte.
+///
+/// Every other assertion about `list` checks a substring. This one compares the
+/// whole stream, which is the only way a test fails when a *new* sentence is
+/// appended to output that was already correct - a substring check passes on
+/// prose nobody wrote an assertion for, which is exactly how 200 lines of
+/// lecture survived a suite this size.
+///
+/// One registered manager, one assigned game, nothing else on the machine:
+/// every extra line has to earn its place.
+#[test]
+fn list_is_exactly_the_documented_shape() {
+    let sandbox = Sandbox::new("list-shape");
+    let (recorder, _) = argv_recorder(&sandbox, "apps/One");
+
+    assert_eq!(
+        code(&run(&sandbox, &["register", "one", &recorder, "--", "%1"])),
+        0
     );
-    // Usage, per manager: the games that reach it.
-    assert!(out.contains("games: helldivers2"), "{out}");
-    assert!(out.contains("no games assigned"), "{out}");
+    assert_eq!(code(&run(&sandbox, &["assign", "one", "skyrimse"])), 0);
+
+    let expected = format!(
+        "config: {}\n\nmod managers:\n  one: {recorder} %1\n    * skyrimse\n",
+        sandbox.config_file().display()
+    );
+    assert_eq!(stdout(&run(&sandbox, &["list"])), expected);
+}
+
+/// Nothing anywhere in the human output explains, suggests, or recaps.
+///
+/// `list --json` is a data contract and is exempt: it carries prose in `note`
+/// fields on purpose, and a GUI renders those as tooltips. This is about the
+/// text a human reads in a terminal.
+///
+/// Each entry below is a sentence this program used to print. The list is a
+/// tombstone, not a wish list: reintroducing any one of them must fail here.
+#[cfg(target_os = "linux")]
+#[test]
+fn no_command_prints_lesson_text() {
+    const REMOVED: &[&str] = &[
+        // `list`: the local-bin inventory line and everything after the colon.
+        "local bin",
+        "symlinks",
+        "not a detection source",
+        // `list`: per-manager provenance and the games parenthetical.
+        "discovered - you have not chosen this one",
+        "registered by you",
+        "no games assigned",
+        // `list`: the closing lesson and the redundant games section.
+        "routes nothing until a game is assigned",
+        "never picks one for you",
+        "every game goes to the only mod manager you registered",
+        "no game is routed to anything",
+        "games:",
+        // `list`/`install`: the candidate block's advice.
+        "nxmproxy discover",
+        "nxmproxy will not choose between them",
+        "nxmproxy assign <name> <game>",
+        "or send every unassigned game",
+        "then pick who owns which game",
+        "so a link would arrive and go nowhere",
+        "Add one now",
+        "Add one by hand",
+        "lists the managers it can find on this machine",
+        // `discover`: the three-command assignment recipe.
+        "Remembered, but assigned to no game",
+        "Nothing changed",
+        "shows what was found and what you have chosen",
+        // `install`/`register`/`test`: trailing hints and parentheticals.
+        "until you `assign` something else",
+        "Re-run with the link code",
+        "the OS will ask you which app to use",
+        "not on this machine, it was uninstalled",
+    ];
+
+    let sandbox = Sandbox::new("no-fluff");
+    let _lock = install_sandbox(&sandbox);
+    let apps = sandbox.data_applications();
+    std::fs::create_dir_all(&apps).unwrap();
+    // Two declared managers, so every command that *could* offer advice has
+    // something to offer it about. One real one to register and assign to.
+    let (recorder, _) = argv_recorder(&sandbox, "apps/HD2Arsenal");
+    let (other, _) = argv_recorder(&sandbox, "apps/Mod Two");
+    std::fs::write(apps.join("HD2Arsenal.desktop"), arsenal_fixture(&recorder)).unwrap();
+    std::fs::write(
+        apps.join("two.desktop"),
+        format!(
+            "[Desktop Entry]\nName=Mod Two\nExec=\"{other}\" %U\nMimeType=x-scheme-handler/nxm;\n"
+        ),
+    )
+    .unwrap();
+
+    // Ordered so the states differ: an empty config, a full one of discovered
+    // managers, one user registration, an unroutable link, an assignment, and a
+    // finished install.
+    let runs: Vec<Vec<&str>> = vec![
+        vec!["list"],
+        vec!["discover"],
+        vec!["test"],
+        vec!["register", "vortex", "/opt/vortex/Vortex", "--", "%1"],
+        vec!["url", "nxm://nowhere/mods/1"],
+        vec!["assign", "vortex", "skyrimse"],
+        vec!["list"],
+        vec!["install"],
+    ];
+    for args in &runs {
+        let out = run(&sandbox, args);
+        let text = format!("{}{}", stdout(&out), stderr(&out));
+        for banned in REMOVED {
+            assert!(
+                !text.contains(banned),
+                "`nxmproxy {}` prints {banned:?}:\n{text}",
+                args.join(" ")
+            );
+        }
+    }
 }
 
 /// The guards detection already has, inherited rather than reimplemented.
@@ -2209,9 +2385,12 @@ fn install_never_writes_a_discovered_manager_on_its_own() {
     }
 
     let installed = run(&sandbox, &["install"]);
+    // Two candidates, so install prints them, and must not run the command that
+    // stores them: `discover` is in `--help`, and printing it is not what makes
+    // this safe - the config not existing is.
     assert!(
-        stdout(&installed).contains("nxmproxy discover"),
-        "install must point at the command that stores them, not run it: {}",
+        stdout(&installed).contains("mod-one") && stdout(&installed).contains("mod-two"),
+        "install must name both candidates it refused to choose between: {}",
         stdout(&installed)
     );
     assert!(
