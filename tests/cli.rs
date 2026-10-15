@@ -1094,9 +1094,20 @@ fn install_registers_a_manager_it_can_prove_is_present() {
         std::fs::read_to_string(sandbox.config_file()).unwrap_or_default()
     );
 
+    // The manager is a real executable that is NOT nxmproxy. Using this very
+    // binary as the stand-in used to work, until nxmproxy stopped treating its
+    // own published `nxmproxy.desktop` as a mod manager - which it must not, or
+    // every install on a single-manager machine would find two candidates and
+    // refuse to choose. Linux-only test, so `sh` is the portable stand-in here.
+    let manager = std::path::Path::new("/bin/sh");
+    assert!(manager.is_file(), "precondition: {manager:?} exists");
+
     std::fs::write(
         apps.join("gamemodmanager-nxm.desktop"),
-        format!("[Desktop Entry]\nExec=\"{}\" --handle-nxm %u\n", bin_path()),
+        format!(
+            "[Desktop Entry]\nExec=\"{}\" --handle-nxm %u\n",
+            manager.display()
+        ),
     )
     .unwrap();
 
@@ -1197,6 +1208,324 @@ fn install_refuses_a_manager_it_could_not_use() {
     );
 }
 
+/// THE bug this whole change is for. HD2Arsenal is a third-party manager, so
+/// it is absent from the curated list by construction, and before this the only
+/// auto-detection was a filename hardcoded to *our own* entry
+/// (`gamemodmanager-nxm.desktop`). Arsenal could never appear there.
+///
+/// The entry below is the real one, with only the two paths that cannot exist
+/// in a sandbox swapped for ones that do. Everything under test is untouched:
+/// the quoted `Exec=`, `Categories=Utility;`, the `MimeType` in the **wrong
+/// group**, the duplicated `x-scheme-handler/nxm`, and the action group
+/// carrying its own `Exec=`.
+///
+/// That last one is what makes this test a control rather than a transcript.
+/// The uninstall action's `Exec=` here points at a file that really exists, so
+/// a group-blind parser registers a resolvable, working-looking manager with
+/// the wrong argv - and the recorded argv is what catches it.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_third_party_manager_that_declares_nxm_handling_is_found_and_routes() {
+    let sandbox = Sandbox::new("arsenal");
+    let _lock = install_sandbox(&sandbox);
+    let apps = sandbox.data_applications();
+    std::fs::create_dir_all(&apps).unwrap();
+    let (recorder, argv_file) = argv_recorder(&sandbox, "My Applications/HD2Arsenal");
+    assert!(recorder.contains(' '), "precondition: a space in the path");
+
+    // Read before install, so nxmproxy's own entry is not on disk yet.
+    let bare = run(&sandbox, &["list", "--json"]);
+    assert_eq!(code(&bare), 0, "{}", stderr(&bare));
+    let json: serde_json::Value = serde_json::from_str(&stdout(&bare)).unwrap();
+    assert_eq!(
+        json["declared_managers"].as_array().unwrap().len(),
+        0,
+        "precondition: nothing declares nxm yet"
+    );
+
+    std::fs::write(
+        apps.join("hd2arsenal.desktop"),
+        format!(
+            "[Desktop Entry]\n\
+             Name=HD2Arsenal\n\
+             Exec=\"{recorder}\" --no-sandbox %U\n\
+             Type=Application\n\
+             Icon=hd2arsenal\n\
+             StartupWMClass=HD2Arsenal\n\
+             X-AppImage-Version=0.36.2\n\
+             Categories=Utility;\n\
+             Actions=Uninstall;\n\
+             \n\
+             [Desktop Action Uninstall]\n\
+             Name=Move to Trash\n\
+             Exec=\"{recorder}\" uninstall %U\n\
+             Icon=user-trash\n\
+             MimeType=x-scheme-handler/rsnl;x-scheme-handler/nxm;application/x-hd2a-project;x-scheme-handler/nxm;\n"
+        ),
+    )
+    .unwrap();
+
+    // `declared_managers` is how a GUI learns about this without running
+    // install, so the discovery is asserted through the same call twice: once
+    // empty, once populated. Only the second tells us anything.
+    let listed = run(&sandbox, &["list", "--json"]);
+    let json: serde_json::Value = serde_json::from_str(&stdout(&listed)).unwrap();
+    let declared = json["declared_managers"].as_array().unwrap();
+    assert_eq!(
+        declared.len(),
+        1,
+        "expected exactly HD2Arsenal: {declared:?}"
+    );
+    let arsenal = &declared[0];
+
+    assert_eq!(arsenal["name"].as_str(), Some("HD2Arsenal"));
+    assert_eq!(
+        arsenal["id"].as_str(),
+        Some("hd2arsenal"),
+        "the id is what the user would type"
+    );
+    assert_eq!(
+        arsenal["exec"].as_str(),
+        Some(recorder.as_str()),
+        "a quoted Exec must not keep its quotes"
+    );
+    assert_eq!(
+        arsenal["mime_types"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|m| m.as_str() == Some("x-scheme-handler/nxm"))
+            .count(),
+        1,
+        "one scheme listed twice is one handler, not two: {:?}",
+        arsenal["mime_types"]
+    );
+
+    // The curated list must not claim credit: its `arsenal` row is a guess
+    // about a binary named `arsenal`, and it is not what was found.
+    assert!(
+        !json["known_managers"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|m| m["name"].as_str() == Some("Arsenal") && m["present"] == true),
+        "the curated guess reported itself as the thing that was found"
+    );
+
+    let installed = run(&sandbox, &["install"]);
+    assert_eq!(
+        code(&installed),
+        0,
+        "{}{}",
+        stdout(&installed),
+        stderr(&installed)
+    );
+    let config = std::fs::read_to_string(sandbox.config_file()).unwrap_or_default();
+    assert!(config.contains("hd2arsenal"), "not registered:\n{config}");
+
+    // And the link routes, which is what proves the argv came from
+    // `[Desktop Entry]` and not from `[Desktop Action Uninstall]`.
+    let link = "nxm://helldivers2/mods/1/files/2";
+    let delivered = run(&sandbox, &["url", link]);
+    assert_eq!(code(&delivered), 0, "{}", stderr(&delivered));
+    assert!(
+        wait_for(&argv_file, "DONE", Duration::from_secs(10)),
+        "the manager never ran: {}",
+        std::fs::read_to_string(&argv_file).unwrap_or_default()
+    );
+    let recorded = std::fs::read_to_string(&argv_file).unwrap();
+    let mut lines: Vec<&str> = recorded.lines().collect();
+    assert_eq!(lines.pop(), Some("DONE"), "{recorded:?}");
+    assert_eq!(
+        lines,
+        vec!["--no-sandbox", link],
+        "the [Desktop Entry] argv must be used; a group-blind parser registers the \
+         uninstall action instead: {recorded:?}"
+    );
+}
+
+/// Two managers that both declare nxm handling is genuinely ambiguous, and
+/// picking one puts downloads in the wrong mod queue. `install` must refuse,
+/// write nothing, and print the exact command for each.
+#[cfg(target_os = "linux")]
+#[test]
+fn install_refuses_to_choose_between_two_declared_managers() {
+    let sandbox = Sandbox::new("declared-two");
+    let _lock = install_sandbox(&sandbox);
+    let apps = sandbox.data_applications();
+    std::fs::create_dir_all(&apps).unwrap();
+
+    let (one, _) = argv_recorder(&sandbox, "apps/Mod One");
+    let (two, _) = argv_recorder(&sandbox, "apps/Mod Two");
+    for (file, name, exec) in [
+        ("one.desktop", "Mod One", &one),
+        ("two.desktop", "Mod Two", &two),
+    ] {
+        std::fs::write(
+            apps.join(file),
+            format!(
+                "[Desktop Entry]\nName={name}\nExec=\"{exec}\" %U\nMimeType=x-scheme-handler/nxm;\n"
+            ),
+        )
+        .unwrap();
+    }
+
+    let installed = run(&sandbox, &["install"]);
+    assert_eq!(
+        code(&installed),
+        3,
+        "two candidates is not a working install: {}{}",
+        stdout(&installed),
+        stderr(&installed)
+    );
+    assert!(
+        !sandbox.config_file().exists(),
+        "install chose one of two: {}",
+        std::fs::read_to_string(sandbox.config_file()).unwrap_or_default()
+    );
+
+    // Both, named, each with the command that registers it - quoted, because
+    // these paths have spaces in them and an unquoted command does not work.
+    let out = stdout(&installed);
+    for (name, id, exec) in [("Mod One", "mod-one", &one), ("Mod Two", "mod-two", &two)] {
+        assert!(out.contains(name), "{name} was not offered:\n{out}");
+        assert!(
+            out.contains(&format!("nxmproxy register {id} \"{exec}\" %1")),
+            "no exact, quoted command for {name}:\n{out}"
+        );
+    }
+}
+
+/// An entry that declares nxm handling and points at a binary that is not
+/// there is refused, named, and never registered.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_declared_manager_whose_executable_is_missing_is_refused_and_named() {
+    let sandbox = Sandbox::new("declared-missing");
+    let _lock = install_sandbox(&sandbox);
+    let apps = sandbox.data_applications();
+    std::fs::create_dir_all(&apps).unwrap();
+    let ghost = sandbox.root.join("not-installed").join("Mod");
+    std::fs::write(
+        apps.join("ghost.desktop"),
+        format!(
+            "[Desktop Entry]\nName=Ghost Manager\nExec={} %U\nMimeType=x-scheme-handler/nxm;\n",
+            ghost.display()
+        ),
+    )
+    .unwrap();
+
+    let listed = run(&sandbox, &["list", "--json"]);
+    let json: serde_json::Value = serde_json::from_str(&stdout(&listed)).unwrap();
+    assert_eq!(
+        json["declared_managers"].as_array().unwrap().len(),
+        0,
+        "an entry naming a binary that is not there is not a manager this machine has"
+    );
+
+    let installed = run(&sandbox, &["install"]);
+    assert_eq!(code(&installed), 3, "{}", stdout(&installed));
+    assert!(
+        !sandbox.config_file().exists(),
+        "registered a manager that cannot be started"
+    );
+    let out = stdout(&installed);
+    assert!(
+        out.contains("Ghost Manager"),
+        "the refusal must name what it skipped and why:\n{out}"
+    );
+    assert!(
+        out.contains("not on this machine"),
+        "the refusal must say the executable is missing:\n{out}"
+    );
+}
+
+/// nxmproxy's own entry declares `x-scheme-handler/nxm`, and `install`
+/// publishes it before running detection. If the router found itself, every
+/// install on a single-manager machine would see two candidates and refuse.
+#[cfg(target_os = "linux")]
+#[test]
+fn nxmproxy_does_not_detect_itself() {
+    let sandbox = Sandbox::new("self-detect");
+    let _lock = install_sandbox(&sandbox);
+    let apps = sandbox.data_applications();
+    std::fs::create_dir_all(&apps).unwrap();
+    let (recorder, _) = argv_recorder(&sandbox, "apps/Real");
+
+    // install publishes nxmproxy.desktop into this same directory.
+    let first = run(&sandbox, &["install"]);
+    assert_eq!(code(&first), 3, "{}", stdout(&first));
+    assert!(
+        apps.join("nxmproxy.desktop").exists(),
+        "precondition: our own entry was published: {}",
+        stdout(&first)
+    );
+
+    // Now the real manager arrives, and it must be the only candidate.
+    std::fs::write(
+        apps.join("real.desktop"),
+        format!("[Desktop Entry]\nName=Real Mod\nExec=\"{recorder}\" %U\nMimeType=x-scheme-handler/nxm;\n"),
+    )
+    .unwrap();
+
+    let second = run(&sandbox, &["install"]);
+    assert_eq!(
+        code(&second),
+        0,
+        "our own entry counted as a second candidate: {}{}",
+        stdout(&second),
+        stderr(&second)
+    );
+    let config = std::fs::read_to_string(sandbox.config_file()).unwrap_or_default();
+    assert!(
+        config.contains("[managers.real-mod]"),
+        "the real manager must win cleanly:\n{config}"
+    );
+    // Not `!config.contains("nxmproxy")` - the sandbox path itself is
+    // `/tmp/nxmproxy-it-...`, so that substring is always there. What matters
+    // is that the router is not a *key*, which is what a second candidate
+    // would have registered.
+    assert_eq!(
+        config.matches("[managers.").count(),
+        1,
+        "the router was registered as its own destination:\n{config}"
+    );
+}
+
+/// The same trap, through a *different build*. `install` publishes
+/// `current_exe()`, so on a real machine the entry in `~/.local/bin` names the
+/// installed binary while we are running a freshly built one. Path comparison
+/// says "different file, not us" - and the router is offered as its own mod
+/// manager. Caught by reading the real machine, not by reasoning.
+#[cfg(target_os = "linux")]
+#[test]
+fn an_entry_naming_another_build_of_nxmproxy_is_not_a_manager() {
+    let sandbox = Sandbox::new("other-build");
+    let apps = sandbox.data_applications();
+    std::fs::create_dir_all(&apps).unwrap();
+
+    // A path that exists, is executable, and is not this process.
+    let other = argv_recorder(&sandbox, "opt/nxmproxy-0.2.0-linux-x86_64").0;
+    assert!(other != bin_path(), "precondition: a different file");
+    std::fs::write(
+        apps.join("nxmproxy.desktop"),
+        format!(
+            "[Desktop Entry]\nType=Application\nName=NXM Proxy\nExec={other} url %u\n\
+             MimeType=x-scheme-handler/nxm;\n"
+        ),
+    )
+    .unwrap();
+
+    let listed = run(&sandbox, &["list", "--json"]);
+    let json: serde_json::Value = serde_json::from_str(&stdout(&listed)).unwrap();
+    assert_eq!(
+        json["declared_managers"].as_array().unwrap().len(),
+        0,
+        "another build of the router is still the router: {}",
+        stdout(&listed)
+    );
+}
+
 /// The GUI's data contract. A shape a GUI can consume without parsing prose.
 #[test]
 fn list_json_is_machine_readable_and_declares_its_version() {
@@ -1214,7 +1543,7 @@ fn list_json_is_machine_readable_and_declares_its_version() {
         .unwrap_or_else(|e| panic!("list --json must be valid JSON: {e}\n{}", stdout(&listed)));
 
     assert_eq!(
-        json["version"], 1,
+        json["version"], 2,
         "a GUI needs a version to refuse politely"
     );
     for key in [
@@ -1223,6 +1552,7 @@ fn list_json_is_machine_readable_and_declares_its_version() {
         "managers",
         "assignments",
         "known_managers",
+        "declared_managers",
         "warnings",
     ] {
         assert!(!json[key].is_null(), "missing key {key} in {json}");
@@ -1267,10 +1597,13 @@ fn list_json_on_a_bare_machine_is_still_valid() {
     let listed = run(&sandbox, &["list", "--json"]);
     assert_eq!(code(&listed), 0, "{}", stderr(&listed));
     let json: serde_json::Value = serde_json::from_str(&stdout(&listed)).unwrap();
-    assert_eq!(json["version"], 1);
+    assert_eq!(json["version"], 2);
     assert_eq!(json["config_writable"], true);
     assert_eq!(json["managers"].as_array().unwrap().len(), 0);
     assert_eq!(json["assignments"].as_array().unwrap().len(), 0);
+    // Present and empty, not absent: a GUI indexing this key must not have to
+    // special-case "the first machine I ran this on".
+    assert!(json["declared_managers"].is_array());
     assert!(panic_markers(&listed).is_empty(), "{}", stderr(&listed));
 }
 

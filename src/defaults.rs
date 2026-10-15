@@ -91,8 +91,10 @@ pub const KNOWN: &[Known] = &[
         name: "Arsenal",
         exec: "arsenal",
         args: &["%1"],
-        note: "Helldivers 2. UNVERIFIED: no public source, so the executable name is a guess. \
-               Set the real path yourself.",
+        note: "Helldivers 2. The name `arsenal` here is still a guess, and is expected to miss: \
+               the real entry is `hd2arsenal.desktop` and the real command takes `--no-sandbox %U`. \
+               It is found properly by `xdg::declared`, which reads the x-scheme-handler/nxm \
+               declaration that entry publishes - so this row exists only to name it in `list`.",
         desktop: None,
     },
 ];

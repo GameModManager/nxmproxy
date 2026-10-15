@@ -15,6 +15,7 @@ mod logger;
 mod pipe;
 mod platform;
 mod route;
+mod xdg;
 
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
@@ -27,7 +28,7 @@ use route::Route;
 
 /// Bumped when the `list --json` shape changes, so a GUI can refuse a format
 /// it does not understand instead of misreading it.
-const LIST_SCHEMA_VERSION: u32 = 1;
+const LIST_SCHEMA_VERSION: u32 = 2;
 
 #[derive(Parser, Debug)]
 #[command(
@@ -155,10 +156,23 @@ fn resolve_exec(exec: &str) -> Option<PathBuf> {
     if as_path.components().count() > 1 {
         return as_path.is_file().then_some(as_path);
     }
-    let paths = std::env::var_os("PATH")?;
+    let mut dirs: Vec<PathBuf> = std::env::var_os("PATH")
+        .map(|paths| std::env::split_paths(&paths).collect())
+        .unwrap_or_default();
+    // `$XDG_BIN_HOME`, else `~/.local/bin`. Installer-managed apps drop a
+    // symlink there for every app they own - `hd2arsenal ->
+    // ~/Applications/HD2Arsenal` on the machine this was written for - so this
+    // is where an `Exec=` name usually lives. Listing it explicitly rather than
+    // trusting `PATH` is what makes it work under a shell profile that never
+    // set `PATH`.
+    if let Some(bin) = xdg::local_bin() {
+        if !dirs.contains(&bin) {
+            dirs.push(bin);
+        }
+    }
     let extensions = pathext_extensions(std::env::var("PATHEXT").ok());
 
-    for dir in std::env::split_paths(&paths) {
+    for dir in dirs {
         let candidate = dir.join(exec);
         if candidate.is_file() {
             return Some(candidate);
@@ -228,6 +242,20 @@ struct JsonKnownManager {
 }
 
 #[derive(serde::Serialize)]
+struct JsonDeclaredManager {
+    id: String,
+    name: String,
+    /// The desktop entry that declared it, so a GUI can say where it found it
+    /// rather than presenting a bare command as magic.
+    entry: String,
+    /// The MIME types that entry declares, deduplicated. The one that matched
+    /// is `x-scheme-handler/nxm`.
+    mime_types: Vec<String>,
+    exec: String,
+    args: Vec<String>,
+}
+
+#[derive(serde::Serialize)]
 struct JsonList<'a> {
     version: u32,
     config_path: String,
@@ -238,6 +266,10 @@ struct JsonList<'a> {
     managers: Vec<JsonManager<'a>>,
     assignments: Vec<JsonAssignment<'a>>,
     known_managers: &'static [JsonKnownManager],
+    /// Applications found by their own `x-scheme-handler/nxm` declaration that
+    /// the curated list above could never contain, because we did not know they
+    /// existed. HD2Arsenal is the case this exists for.
+    declared_managers: Vec<JsonDeclaredManager>,
     warnings: &'a [String],
 }
 
@@ -314,27 +346,56 @@ fn exec_line_of(entry: &str) -> Option<String> {
 }
 
 /// A manager that is actually installed here, and how to invoke it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Candidate {
+    /// The id `register` would give it.
+    pub id: String,
+    pub name: String,
+    pub manager: Manager,
+}
+
+/// An id for a manager we have no curated entry for: its `Name=`, lowercased
+/// and reduced to characters a user can type.
+///
+/// "HD2Arsenal" becomes `hd2arsenal`, which is what the user would have
+/// guessed, so the command we print is the command they would have written.
+fn id_for(name: &str) -> String {
+    let mut id = String::with_capacity(name.len());
+    for ch in name.chars() {
+        if ch.is_alphanumeric() {
+            id.extend(ch.to_lowercase());
+        } else if !id.ends_with('-') {
+            id.push('-');
+        }
+    }
+    id.trim_matches('-').to_string()
+}
+
+/// Every manager this machine can prove it has, from both sources.
 ///
 /// Two sources, in order of trust:
 ///
-/// 1. **The manager's own XDG desktop entry**, when it has one. That file is
-///    written by the manager itself and holds its real `Exec=` line, so reading
-///    it requires no guess at all. This is the only thing that works for GameMod
-///    Manager on Linux: QtIFW installs it to a prefix that is **not** on `PATH`,
-///    so `resolve_exec("gamemodmanager")` finds nothing on a machine where GMM is
-///    plainly installed, while the desktop entry exists and names the binary.
-/// 2. **`PATH`**, for everything else.
+/// 1. **The application's own XDG desktop entry**, when it declares
+///    `x-scheme-handler/nxm`. That is the XDG declaration of "I take nxm
+///    links", published by the application itself and read by the desktop to
+///    route links, and it needs no knowledge of the application at all. This is
+///    what finds HD2Arsenal, and any third-party manager published the same
+///    way - the curated list below could never find one, because a third-party
+///    app never appears in our own list.
+/// 2. **The curated list**, by its desktop file where it has one and `PATH`
+///    otherwise. This is what catches a manager with no desktop entry at all.
 ///
-/// A candidate is accepted only when the resulting executable really resolves.
-/// Registering a manager that cannot be started would produce exactly the broken
-/// install this exists to prevent, so an unresolvable candidate is a refusal
-/// rather than a warning. Refusing is safe: the caller prints the command to type.
+/// A candidate is accepted only when the resulting executable really resolves
+/// and its argv really receives the link. Registering a manager that cannot be
+/// started, or that is started and handed nothing, is exactly the broken
+/// install this exists to prevent - so an unusable candidate is dropped and the
+/// caller prints the command to type instead.
 ///
-/// Only ever consulted when the configuration has **no** managers at all, and
-/// only ever returns a single one. A user who configured something has already
-/// answered this question.
-pub fn detect_manager() -> Option<(&'static defaults::Known, Manager)> {
-    let candidates: Vec<(&'static defaults::Known, Manager)> = defaults::KNOWN
+/// Duplicates are collapsed on the invocation, not on the name: one program
+/// described by two desktop files in two directories is one manager, and
+/// counting it twice would manufacture an ambiguity out of a single app.
+pub fn detect_candidates() -> Vec<Candidate> {
+    let mut candidates: Vec<Candidate> = defaults::KNOWN
         .iter()
         .filter_map(|known| {
             let from_entry =
@@ -360,16 +421,60 @@ pub fn detect_manager() -> Option<(&'static defaults::Known, Manager)> {
                 },
                 None => return None,
             };
-            Some((known, manager))
+            Some(Candidate {
+                id: known.id.to_string(),
+                name: known.name.to_string(),
+                manager,
+            })
         })
         .collect();
 
-    // Exactly one, or none. Two managers installed is genuinely ambiguous and
-    // guessing routes downloads to the wrong mod queue, which is the failure
-    // `Route::Ambiguous` exists to refuse at click time. `install` must not
-    // invent the very ambiguity it refuses to resolve later.
-    match candidates.as_slice() {
-        [(only, manager)] => Some((*only, manager.clone())),
+    for declared in declared_candidates() {
+        // The same application reached by both routes is one manager, and the
+        // curated entry keeps the documented id.
+        if candidates
+            .iter()
+            .any(|seen| seen.manager == declared.manager)
+        {
+            continue;
+        }
+        candidates.push(declared);
+    }
+
+    candidates
+}
+
+/// Candidates that came from an application's **own** nxm declaration.
+///
+/// The third-party finds, which [`defaults::KNOWN`] cannot contain by
+/// construction: a manager we never heard of has no entry in our curated list,
+/// and that is the entire class of application this covers. `list --json`
+/// reports them separately so a GUI can offer them as a one-click register.
+fn declared_candidates() -> Vec<Candidate> {
+    xdg::declared()
+        .into_iter()
+        .filter(|declared| {
+            resolve_exec(&declared.manager.exec).is_some()
+                && declared.manager.args.iter().any(|arg| arg == "%1")
+        })
+        .map(|declared| Candidate {
+            id: id_for(&declared.name),
+            name: declared.name,
+            manager: declared.manager,
+        })
+        .collect()
+}
+
+/// The one manager `install` may register on the user's behalf, or `None`.
+///
+/// Exactly one or nothing. Two managers installed is genuinely ambiguous and
+/// guessing routes downloads to the wrong mod queue, which is the failure
+/// `Route::Ambiguous` exists to refuse at click time. `install` must not
+/// invent the very ambiguity it refuses to resolve later - and it must not
+/// pick the "nicer looking" one either, so there is no preference to express.
+fn sole_candidate(candidates: &[Candidate]) -> Option<&Candidate> {
+    match candidates {
+        [only] => Some(only),
         _ => None,
     }
 }
@@ -448,10 +553,160 @@ fn list_json(config: &Config, loaded: &config::Loaded, dir: &Path) -> String {
             .map(|(domain, manager)| JsonAssignment { domain, manager })
             .collect(),
         known_managers: known_managers_json(),
+        declared_managers: xdg::declared()
+            .into_iter()
+            .filter(|declared| {
+                resolve_exec(&declared.manager.exec).is_some()
+                    && declared.manager.args.iter().any(|arg| arg == "%1")
+            })
+            .map(|declared| JsonDeclaredManager {
+                id: id_for(&declared.name),
+                entry: declared.entry.to_string_lossy().into_owned(),
+                exec: declared.manager.exec,
+                args: declared.manager.args,
+                name: declared.name,
+                mime_types: declared.mime_types,
+            })
+            .collect(),
         warnings: &loaded.warnings,
     };
     // BTreeMaps plus declared field order make this byte stable across runs.
     serde_json::to_string_pretty(&payload).expect("the list payload is all owned, printable data")
+}
+
+/// The exact command a user types to register `candidate`.
+///
+/// Quoted where it has to be, because the single most common reason this
+/// project's users are here is a path with a space in it - and an unquoted
+/// command we print is a command that does not work.
+fn register_command(candidate: &Candidate) -> String {
+    fn quote(value: &str) -> String {
+        if value.contains(char::is_whitespace) {
+            format!("\"{value}\"")
+        } else {
+            value.to_string()
+        }
+    }
+    std::iter::once("nxmproxy".to_string())
+        .chain([
+            "register".to_string(),
+            candidate.id.clone(),
+            quote(&candidate.manager.exec),
+        ])
+        .chain(candidate.manager.args.iter().map(|a| quote(a)))
+        .collect::<Vec<String>>()
+        .join(" ")
+}
+
+/// Applications that declared nxm handling but cannot be used, as a line a user
+/// can act on.
+///
+/// Dropping them in silence is the one thing worse than refusing them: there
+/// is an entry on disk declaring the application handles nxm, nxmproxy found
+/// nothing, and the message says there is nothing to be found.
+fn unusable_declarations() -> Vec<String> {
+    xdg::declared()
+        .into_iter()
+        .filter(|declared| resolve_exec(&declared.manager.exec).is_none())
+        .map(|declared| {
+            format!(
+                "{} ({}) - not on this machine",
+                declared.name, declared.manager.exec
+            )
+        })
+        .collect()
+}
+
+/// Print what this machine has, and the command to use it.
+///
+/// A candidate list and a choice, never a choice made for the user: routing an
+/// nxm link into the wrong mod manager puts a download in somebody else's
+/// queue, which is worse than not routing it at all.
+fn print_candidates(candidates: &[Candidate]) {
+    let refused = unusable_declarations();
+    if candidates.is_empty() {
+        println!(
+            "\nnxmproxy handles nxm://, but there is no mod manager to forward to, so a\n\
+                  link would arrive and go nowhere. Add one now:\n\n    \
+                  nxmproxy register gamemodmanager gamemodmanager -- --handle-nxm %1\n\n\
+                  `nxmproxy list --json` lists the managers it can find on this machine."
+        );
+        print_refused(&refused);
+        return;
+    }
+
+    let count = candidates.len();
+    println!(
+        "\n{count} application{} on this machine {} nxm:// links:",
+        if count == 1 { "" } else { "s" },
+        if count == 1 { "declares" } else { "declare" }
+    );
+    if count > 1 {
+        println!("nxmproxy will not choose between them for you. Register the one you want:");
+    }
+    for candidate in candidates {
+        println!("\n  {}", candidate.name);
+        println!("    {}", register_command(candidate));
+    }
+    if count > 1 {
+        println!("\nthen pick who owns which game:\n\n    nxmproxy assign <name> <game>");
+        println!("or send every unassigned game to one of them:\n    nxmproxy assign <name> _");
+    }
+
+    print_refused(&refused);
+}
+
+/// Applications we found and would not use, named, with the reason.
+///
+/// The path this takes matters: the common case for an entry being refused is
+/// a *partly* working install, and "nothing found" for a user who can see the
+/// desktop entry would be a lie.
+fn print_refused(refused: &[String]) {
+    if refused.is_empty() {
+        return;
+    }
+    println!(
+        "\nskipped {} application{} that declared nxm:// handling but nxmproxy cannot start:",
+        refused.len(),
+        if refused.len() == 1 { "" } else { "s" }
+    );
+    for line in refused {
+        println!("  {line}");
+    }
+}
+
+/// Where the per-user executable directory is, and what it is for.
+///
+/// Reported because it is the usual answer to "where did the name in that
+/// `Exec=` line go", and because installer-managed apps drop a symlink there
+/// for every app they own. Never a detection source: what is in it says a
+/// program runs, not that it takes an nxm link.
+fn print_local_bin() {
+    let Some(bin) = xdg::local_bin() else {
+        return;
+    };
+    if !bin.is_dir() {
+        return;
+    }
+    let Ok(entries) = std::fs::read_dir(&bin) else {
+        return;
+    };
+    let mut total = 0;
+    let mut symlinks = 0;
+    for entry in entries.flatten() {
+        total += 1;
+        if entry.path().is_symlink() {
+            symlinks += 1;
+        }
+    }
+    if total == 0 {
+        return;
+    }
+    println!(
+        "local bin: {} ({total} entries, {symlinks} symlinks) - where installer-managed apps \
+         point their names at, not a detection source",
+        bin.display()
+    );
 }
 
 fn print_list(config: &Config, loaded: &config::Loaded, dir: &Path) {
@@ -459,11 +714,11 @@ fn print_list(config: &Config, loaded: &config::Loaded, dir: &Path) {
     for warning in &loaded.warnings {
         eprintln!("warning: {warning}");
     }
+    print_local_bin();
 
     if config.managers.is_empty() {
         println!("\nno mod managers registered.");
-        println!("  nxmproxy register vortex /path/to/vortex.exe -- %1");
-        println!("  see `nxmproxy list --json` for a curated list of known managers");
+        print_candidates(&detect_candidates());
         return;
     }
 
@@ -601,34 +856,32 @@ fn handle_install(config: &mut Config, save: &dyn Fn(&Config) -> i32) -> i32 {
     if already_configured {
         println!("Keeping the mod managers already in your configuration.");
     } else {
-        match detect_manager() {
-            Some((known, manager)) => match config.register_manager(known.id, manager) {
-                Ok(()) => {
-                    routing_ready = true;
-                    let saved = save(config);
-                    if saved != platform::EXIT_OK {
-                        code = saved;
-                    }
-                    println!(
-                        "Found {} on this machine and registered it as {}. Every game routes to \
-                         it until you `assign` something else.",
-                        known.name, known.id
-                    );
-                }
-                Err(message) => {
-                    // Not fatal, and not a claim failure either: the scheme is
-                    // claimed and the user can type the command by hand.
-                    eprintln!("nxmproxy: could not pre-register {}: {message}", known.name);
-                }
-            },
-            None => {
-                println!(
-                    "\nnxmproxy handles nxm://, but there is no mod manager to forward to, so a\n\
-                     link would arrive and go nowhere. Add one now:\n\n    \
-                     nxmproxy register gamemodmanager gamemodmanager -- --handle-nxm %1\n\n\
-                     `nxmproxy list --json` lists the managers it can find on this machine."
+        match sole_candidate(&detect_candidates()) {
+            Some(candidate) => {
+                match config.register_manager(&candidate.id, candidate.manager.clone()) {
+                    Ok(()) => {
+                        routing_ready = true;
+                        let saved = save(config);
+                        if saved != platform::EXIT_OK {
+                            code = saved;
+                        }
+                        println!(
+                    "Found {} on this machine and registered it as {}. Every game routes to \
+                     it until you `assign` something else.",
+                    candidate.name, candidate.id
                 );
+                    }
+                    Err(message) => {
+                        // Not fatal, and not a claim failure either: the scheme is
+                        // claimed and the user can type the command by hand.
+                        eprintln!(
+                            "nxmproxy: could not pre-register {}: {message}",
+                            candidate.name
+                        );
+                    }
+                }
             }
+            None => print_candidates(&detect_candidates()),
         }
     }
 

@@ -68,6 +68,11 @@ Every item here is a deliberate change, with the reason.
 * **`install` claims the scheme**, not just registers. See below.
 * **Auto-registration on a fresh install**, when a manager can be proven present.
   See "Finding the mod manager".
+* **Detection by declaration, not by a known filename.** A manager is found
+  because its own desktop entry says `MimeType=x-scheme-handler/nxm`, so any
+  third-party manager works without being added to this project. Before this,
+  the only thing auto-detection could do was look for *our own* entry filename.
+  See "Finding the mod manager".
 * **Tests and CI.** Upstream had no tests at all.
 * **A release pipeline** producing one static Linux binary, the licence and the
   checksum. See "The Linux binary".
@@ -296,14 +301,31 @@ What was considered:
 | Ship GMM pre-registered in the default config | **Rejected.** It hardcodes a path that is wrong on most machines, so the default is broken more often than it works - and a broken default is worse than no default, because it fails at click time rather than at install time |
 | Require the user to run `register` first | **Rejected as the whole answer.** It is the correct *fallback* and remains one, but an out-of-the-box install that routes nothing is a broken install |
 | Ask the OS who currently handles `nxm://` | **Rejected.** On Windows that returns a command line, and parsing it means reintroducing the `CommandLineToArgvW` quoting this fork deleted upstream's use of. On macOS it is not readable at all |
-| **Auto-detect from the manager's own desktop entry** | **Chosen** |
+| **Auto-detect from the application's own desktop entry** | **Chosen** - keyed on its `x-scheme-handler/nxm` declaration, not on a filename known in advance |
 
-The chosen approach reads the XDG desktop entry the manager writes for itself.
-GameMod Manager writes
-`~/.local/share/applications/gamemodmanager-nxm.desktop` when the user enables
-its nxm handling, and that file contains its real `Exec=` line. So the path is
-not guessed: it is read from the only place it is recorded. This is the signal
-that works when `PATH` does not, which is the case that actually occurs.
+The chosen approach asks the applications themselves. A desktop entry that
+declares `MimeType=x-scheme-handler/nxm` is saying, in the XDG sense, "I take
+nxm links" - that is the key the specification defines for exactly this, it is
+what the desktop itself uses to route a link, and MO2 and Vortex publish it the
+same way. It is a **declaration, not a heuristic**, and it is why a manager this
+project has never heard of can be found without a single line of code naming it.
+
+The directories scanned, all read-only:
+
+| Where | Why |
+| --- | --- |
+| `$XDG_DATA_HOME/applications` | The specification's first application directory. |
+| every `$XDG_DATA_DIRS/applications` | System-wide. Defaults to `/usr/local/share` and `/usr/share` when unset, as the specification says. |
+| `~/.local/share/applications` | Where per-user entries actually land. |
+| `$XDG_CONFIG_HOME/applications`, `~/.config/applications` | Listed by the specification, and where a user who hand-dropped an entry means it. |
+
+`~/.local/bin` (`$XDG_BIN_HOME`) is searched when **resolving** an executable,
+and is reported by `list`, but it is **never a detection source**. What is in it
+says a program runs; it says nothing about whether the program takes an nxm
+link. It is worth knowing because installer-managed apps drop a symlink there
+for every app they own - on the machine this was written on,
+`~/.local/bin` holds 60 entries, 42 of them symlinks, including
+`hd2arsenal -> ~/Applications/HD2Arsenal`.
 
 The rules are deliberately narrow, because every wider rule is worse:
 
@@ -316,10 +338,83 @@ The rules are deliberately narrow, because every wider rule is worse:
   ambiguity it refuses to resolve at click time.
 * **Only when the executable really resolves.** Registering a manager that cannot
   be started is the broken install this exists to prevent.
-* **Only when the parsed argv contains `%1`.** A manager that never receives the
-  link would be started for every download and handed nothing.
-* Otherwise: **refuse, and print the exact command to type.** A refusal with
-  instructions beats a guess, and it exits 3 so a script knows.
+* **Only when the parsed argv contains `%1`, `%u` or `%U`.** A manager that never
+  receives the link would be started for every download and handed nothing.
+* **Never nxmproxy itself.** `install` publishes our own entry *before* it runs
+  detection, and the router is not its own destination. Matching is by
+  executable path **and** by entry name, because `install` writes
+  `current_exe()` and an installed older build is a different file while being
+  exactly as much the router as we are.
+* Otherwise: **refuse, and print the exact command to type**, quoted where the
+  path has a space in it. A refusal with instructions beats a guess, and it
+  exits 3 so a script knows.
+
+### Two traps in one real entry, both handled
+
+The entry this was written for, HD2Arsenal 0.36.2, unmodified, contains both of
+the things that break a naive reader. `src/xdg.rs` carries it verbatim as a test
+fixture for exactly this reason.
+
+**A quoted `Exec=`.** `Exec="/home/petrica/Applications/HD2Arsenal" --no-sandbox %U`
+split on whitespace yields `"/home/petrica/Applications/HD2Arsenal"` as argv[0],
+quotes attached, so the file does not exist and the manager silently never
+receives a link. It is parsed into a real argv:
+
+```text
+["/home/petrica/Applications/HD2Arsenal", "--no-sandbox", "%1"]
+```
+
+**An `Exec=` in the wrong group.** The entry also has a
+`[Desktop Action Uninstall]` group, and that group carries its own `Exec=`:
+
+```ini
+Exec=/home/petrica/Applications/AppManager uninstall "/home/petrica/Applications/HD2Arsenal"
+```
+
+Reading `Exec=` by scanning the file for the key rather than by group picks that
+one up, and delivering a link to it asks a package manager to **uninstall the
+mod manager**. `Exec=` is therefore read from `[Desktop Entry]` and nowhere else.
+
+The asymmetry is deliberate and is the other trap: in that same entry, the
+`MimeType` line is **not** under `[Desktop Entry]` at all - it is under
+`[Desktop Action Uninstall]`, twice listing `x-scheme-handler/nxm`. A strict
+group-only reader does not see HD2Arsenal at all, which defeats the entire
+purpose. So `MimeType` is read from any group, while `Exec=` is read only from
+`[Desktop Entry]`. That is safe in the one direction that matters: a stray
+`MimeType` under an action group can never make `AppManager uninstall` into
+something we would spawn, because the argv still comes from `[Desktop Entry]`.
+
+`Categories=` is deliberately **not** used. HD2Arsenal ships `Categories=Utility;`,
+the same as a text editor, so category matching would have taken a calculator.
+
+### What a refusal looks like
+
+Two managers is the common case once detection works, because the whole point is
+that third-party managers are now visible. On the machine this was written on:
+
+```text
+2 applications on this machine declare nxm:// links:
+nxmproxy will not choose between them for you. Register the one you want:
+
+  GameMod Manager
+    nxmproxy register gamemodmanager /home/u/.../gamemodmanager --handle-nxm %1
+
+  HD2Arsenal
+    nxmproxy register hd2arsenal /home/u/Applications/HD2Arsenal --no-sandbox %1
+
+then pick who owns which game:
+
+    nxmproxy assign <name> <game>
+```
+
+An entry that declares nxm handling but points at a binary that is not installed
+is reported rather than silently dropped - "nothing found" for a user who can
+see the desktop entry would be a lie:
+
+```text
+skipped 1 application that declared nxm:// handling but nxmproxy cannot start:
+  Amethyst Mod Manager (NXM Handler) (/home/u/Applications/Amethyst Mod Manager) - not on this machine
+```
 
 With exactly one registered manager, routing rule 3 sends every unassigned
 domain to it, so a fresh install routes with no further configuration.
@@ -332,8 +427,10 @@ domain to it, so a fresh install routes with no further configuration.
 > alternative - guessing at a `Program Files` path or scanning an `.app` bundle -
 > would be a guess, and this tool does not guess.
 
-`nxmproxy list --json` reports the same judgement per entry as `present`, so a
-GUI can offer the same one-click register.
+`nxmproxy list --json` reports the same judgement two ways, so a GUI can offer
+the same one-click register: `present` per entry in the curated
+`known_managers`, and the whole `declared_managers` list for applications found
+by declaration.
 
 ## Command line
 
@@ -442,7 +539,7 @@ order). Unknown keys are ignored by readers.
 
 ```json
 {
-  "version": 1,
+  "version": 2,
   "config_path": "/home/u/.config/nxmproxy/config.toml",
   "config_writable": true,
   "managers": [
@@ -467,17 +564,32 @@ order). Unknown keys are ignored by readers.
       "note": "Windows default install path. Also exposes a named pipe: vortex_download."
     }
   ],
+  "declared_managers": [
+    {
+      "id": "hd2arsenal",
+      "name": "HD2Arsenal",
+      "entry": "/home/u/.local/share/applications/hd2arsenal.desktop",
+      "mime_types": [
+        "x-scheme-handler/rsnl",
+        "x-scheme-handler/nxm",
+        "application/x-hd2a-project"
+      ],
+      "exec": "/home/u/Applications/HD2Arsenal",
+      "args": ["--no-sandbox", "%1"]
+    }
+  ],
   "warnings": []
 }
 ```
 
 | Field | Why it is there |
 | --- | --- |
-| `version` | A GUI must be able to refuse a shape it does not understand instead of misreading it. |
+| `version` | A GUI must be able to refuse a shape it does not understand instead of misreading it. **2** added `declared_managers`; a reader that only knows 1 should refuse rather than ignore the new managers and present a GUI that cannot register HD2Arsenal. |
 | `config_writable` | `false` when the file exists but does not parse. A GUI must **not** offer to save in that state, because saving would overwrite the file the user still needs to repair. |
 | `managers[].takes_url` | `false` when no element of `args` contains `%1`, i.e. the manager would be launched and handed nothing. A GUI can show this before the user clicks a link. |
 | `managers[].exec_exists` | Whether the executable is actually present on this machine, so a GUI can flag a broken entry instead of letting the user discover it when a link silently fails. |
 | `known_managers` | The curated list, so a GUI need not hardcode it. **Data only, never registered.** Each entry carries a `note` saying what is and is not verified about it. |
+| `declared_managers` | Applications found by their **own** `x-scheme-handler/nxm` declaration. Not in `known_managers` because we cannot have known about them in advance - that is the whole point. **Data only, never registered.** Each entry carries the `entry` it was read from, so a GUI can say where it found it rather than presenting a command as magic. |
 | `warnings` | Anything dropped while loading, so the user is not left guessing. |
 
 The shape resembles GameModManager's `gmm.supported-games/1` only in that both
