@@ -39,15 +39,54 @@ pub const CONFIG_FILE: &str = "config.toml";
 /// The reserved domain key meaning "every game with no explicit assignment".
 pub const CATCH_ALL: &str = "_";
 
+/// The field codes that mean "the link goes here".
+///
+/// `%1` is nxmproxy's own token. `%u` and `%U` are the desktop entry
+/// specification's codes for the same thing, and they are what an Electron,
+/// AppImage or Flatpak entry writes, so a manager registered with the argument
+/// vector copied out of its own desktop entry still receives the link. All
+/// three are accepted; nothing else about the vector changes.
+const URL_FIELDS: [&str; 3] = ["%1", "%u", "%U"];
+
+/// True when `arg` asks for the link, by any of the three spellings.
+fn asks_for_url(arg: &str) -> bool {
+    URL_FIELDS.iter().any(|field| arg.contains(field))
+}
+
+/// Put `url` where a field code asked for it, inside one argument.
+///
+/// **One pass over the argument.** The url arrives from a browser and is
+/// untrusted, so a url that itself contains `%u` must not be re-scanned for
+/// field codes and substituted into a second time.
+pub fn substitute_url(arg: &str, url: &str) -> String {
+    let mut out = String::with_capacity(arg.len());
+    let mut rest = arg;
+    while let Some(at) = rest.find('%') {
+        let (head, tail) = rest.split_at(at);
+        out.push_str(head);
+        // `get` rather than slicing: a `%` followed by a multi-byte character
+        // is not a field code, and must not be a panic.
+        if tail.get(..2).is_some_and(|f| URL_FIELDS.contains(&f)) {
+            out.push_str(url);
+            rest = &tail[2..];
+        } else {
+            out.push('%');
+            rest = &tail[1..];
+        }
+    }
+    out.push_str(rest);
+    out
+}
+
 /// One mod manager: an executable plus a fixed argument vector.
 ///
-/// `%1` inside any element of `args` is replaced by the nxm url at dispatch
-/// time. See [`crate::route::spawn_args`].
+/// `%1`, `%u` or `%U` inside any element of `args` is replaced by the nxm url
+/// at dispatch time. See [`crate::route::spawn_args`].
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Manager {
     /// Executable path, or a bare command name resolved through `PATH`.
     pub exec: String,
-    /// Fixed arguments, passed verbatim apart from `%1` substitution.
+    /// Fixed arguments, passed verbatim apart from the link substitution.
     #[serde(default)]
     pub args: Vec<String>,
     /// Optional named pipe tried before spawning. Windows only; see
@@ -58,8 +97,12 @@ pub struct Manager {
 
 impl Manager {
     /// True when the url will actually reach the manager.
+    ///
+    /// Shares the field codes with [`substitute_url`], so this can never say
+    /// "no link" about a manager that is about to be given one - which is the
+    /// disagreement a GUI reads `takes_url` to warn the user about.
     pub fn takes_url(&self) -> bool {
-        self.args.iter().any(|a| a.contains("%1"))
+        self.args.iter().any(|a| asks_for_url(a))
     }
 }
 

@@ -42,7 +42,7 @@ Every item here is a deliberate change, with the reason.
 | --- | --- | --- |
 | `config.resolve(game).expect("Failed to find manager for game")` (`src/main.rs:83`) | An unroutable domain is a **value** with a message naming the domain and the command to type next | An `nxm` link for a game nobody configured is ordinary traffic. Upstream showed the user a crash dialog for it. |
 | `toml::from_str(...).expect("Failed to parse game config")` (`src/config_file.rs:31`) | One bad byte degrades to an empty config plus a warning; **writes are refused** while the file is unparseable, so the file the user needs to repair is never overwritten | Upstream panicked the handler for every link on the machine. |
-| `command.replace("%1", url)` **then** `CommandLineToArgvW` (`src/main.rs:98-100`) | The command is held as an **argv vector** and `%1` is substituted inside a single element | Upstream substituted into a string and then split it, so a URL containing `"` produced a different and wrong argument vector. See the failure below. |
+| `command.replace("%1", url)` **then** `CommandLineToArgvW` (`src/main.rs:98-100`) | The command is held as an **argv vector** and the field code is substituted inside a single element, with `%1`, `%u` and `%U` all accepted | Upstream substituted into a string and then split it, so a URL containing `"` produced a different and wrong argument vector. See the failure below. The extra spellings are not an improvement over upstream so much as the completion of the fix: upstream read its token out of a Windows `Exec` command line, and a desktop entry spells that `%u` or `%U`. |
 | `Url::parse(url).expect("Failed to parse url")` | Validated, with the reason returned | The URL comes from a browser. It is untrusted input. |
 | `.spawn().expect("Failed to spawn manager")` | Reported as a message, exit 1 | A missing executable is a configuration problem, not a crash. |
 | `deregister` removed the manager but left `games` entries pointing at it (`src/config_file.rs:73-77`) | Removing a manager removes its assignments | A dangling id made that game unroutable forever, with no way to see why. |
@@ -69,6 +69,8 @@ Every item here is a deliberate change, with the reason.
 * **Auto-registration on a fresh install**, when a manager can be proven present.
   See "Finding the mod manager".
 * **Tests and CI.** Upstream had no tests at all.
+* **A release pipeline** producing one static Linux binary, the licence and the
+  checksum. See "The Linux binary".
 
 ### Changed: `install` now claims the scheme, and says whether it worked
 
@@ -339,7 +341,7 @@ GUI can offer the same one-click register.
 | --- | --- |
 | `install` | Install nxmproxy as the `nxm://` handler: full configuration **and** claim. |
 | `uninstall` | Remove nxmproxy as the handler (symmetric with `install`). |
-| `register <name> <exec> [-- <args>...]` | Add a mod manager. |
+| `register <name> <exec> [<args>...]` | Add a mod manager. |
 | `unregister <name>` | Remove a mod manager, and its game assignments. |
 | `assign <manager> <domain>` | Routing. `<domain>` is the `nexusmods.com` subdomain, or `_` for every game with no assignment. |
 | `list [--json]` | The routing table. `--json` is the machine-readable contract. |
@@ -347,8 +349,33 @@ GUI can offer the same one-click register.
 | `pipe <manager> <pipe>` | Give a manager a named pipe to try before spawning it. |
 | `url <nxm url>` | Forward a link. This is what the OS invokes. |
 
-`%1` inside any element of `args` is where the link goes. Use `--` before the
-argument vector so a link or flag-looking argument is never parsed as an option.
+### The link field code: `%1`, `%u`, `%U`
+
+Inside any argument, the place the link goes is marked with `%1`, `%u` or
+`%U`. All three mean the same thing and all three substitute. `%1` is
+nxmproxy's own token; `%u` and `%U` are the desktop entry specification's, and
+they are what an Electron, AppImage or Flatpak entry writes, so a manager
+registered with the argument vector copied out of its own desktop entry works:
+
+```sh
+# This is the line a user types, and it is the one the test asserts on.
+nxmproxy register "HD2Arsenal" /home/petrica/Applications/HD2Arsenal --no-sandbox %U
+```
+
+The substitution happens **inside one argument**, never by splitting a string,
+so a URL containing a space or a quote arrives as exactly one argument. An
+executable path containing a space is equally not a problem: the command is
+stored as an argv vector, not a string. That is the bug upstream had, and it is
+the reason `register` takes an exec plus a vector rather than a command string.
+
+`--` before the argument vector is **optional**. It still works and still means
+the same thing; it is not required because a user reading `Exec=` off a desktop
+entry does not type it, and rejecting that with exit 2 was a refusal of the
+ordinary case rather than of a mistake.
+
+`list --json` reports `takes_url` for every entry, which is true when **any**
+argument holds one of the three codes. A GUI can show it before the user clicks
+a link.
 
 ### Names: upstream, and this fork
 
@@ -359,7 +386,7 @@ mapping, verified against that source:
 | Upstream | Here | Change |
 | --- | --- | --- |
 | `Url` | `url` | - |
-| `Register { manager, command }` | `register <name> <exec> [-- <args>...]` | **Same name, different arguments.** Upstream's took a command *string*; this takes an exec plus an argv vector |
+| `Register { manager, command }` | `register <name> <exec> [<args>...]` | **Same name, different arguments.** Upstream's took a command *string*; this takes an exec plus an argv vector |
 | `Deregister { manager }` | `unregister <name>` | Renamed. It removes rather than deregisters |
 | `Assign` | `assign` | - |
 | `Pipe` | `pipe` | - |
@@ -522,43 +549,74 @@ Every CLI test runs in a throwaway config directory and a throwaway
 
 ### CI
 
-`.github/workflows/ci.yml` runs `cargo fmt --check`, `clippy -D warnings`,
-`cargo build --release` and `cargo test` on **Linux, macOS and Windows**.
+`.github/workflows/ci.yml` **builds**. It runs `cargo fmt --check`,
+`clippy -D warnings` and `cargo build --release` on **Linux, macOS and
+Windows**, and that is all. It does not run the tests: the suite lives in the
+repo and `cargo test` runs all of it, but running it on every commit on three
+platforms costs minutes and tells the author things they can see in five
+seconds on their own machine. Local verification is the author's job; CI exists
+for the one thing a single machine cannot do, which is proving the crate
+compiles everywhere at once.
 
-> **What the CI run proves on macOS and Windows, precisely:** the crate compiles
-> there, and every test that does not need a real OS passes. The macOS plist, the
-> macOS `LSSetDefaultHandlerForURLScheme` decision, the Windows registry
-> operation list and the Windows Default Apps URI are all pure functions over
-> text and decisions, so they compile and pass on all three platforms - which is
-> why the rule that **macOS and Windows never report a verified claim** is
-> enforced from a Linux build rather than only on the platform it concerns.
+> **What the CI build proves on macOS and Windows, precisely:** the crate
+> compiles there, and every load-bearing decision in it is pure - the platform
+> module text, the macOS `LSSetDefaultHandlerForURLScheme` decision, the
+> Windows registry operation list and the Windows Default Apps URI. That is why
+> the rule that **macOS and Windows never report a verified claim** is enforced
+> from a Linux build rather than only on the platform it concerns.
 >
-> **What it does not prove:** that `LSSetDefaultHandlerForURLScheme` makes macOS
-> offer the bundle, that the prompt appears, or that `reg.exe` writes the Windows
-> keys as intended. The `tests/cli.rs` round trip is compiled out on macOS,
-> because `install` is killed there before it prints anything; it runs on Linux
-> and Windows, verifying the CLI contract and the exit codes rather than the OS
-> integration. On macOS the detection decision is covered instead through
-> `list --json`. Those OS integrations need a real machine and a real click.
+> **What it does not prove:** that `LSSetDefaultHandlerForURLScheme` makes
+> macOS offer the bundle, that the prompt appears, or that `reg.exe` writes the
+> Windows keys as intended. Those need a real machine and a real click, and are
+> called out as unverified above.
 >
-> This split is not hypothetical. The **first CI run of the claiming work failed
-> on all three platforms**, and every failure was one a Linux build could not
-> see:
+> Nothing that the tests caught is unchecked, only run by hand. For the record,
+> what they caught while they were being written - and what no single-platform
+> build could have seen:
 >
 > * macOS: the unit tests made a real LaunchServices call and the binary died
 >   with SIGTRAP before printing a test name.
 > * macOS: two integration tests died because the real binary aborts on a
 >   headless runner.
 > * Windows: tests that run `install` share one real `HKCU` and the sandbox
->   cannot isolate it, so cargo's parallel threads overwrote each other and `test`
->   reported registered before anything had been installed.
-> * Linux: the argv-recording test waited for a file to *exist* rather than to be
->   finished, so on a loaded runner it read a half-written argv and reported a
->   link that had lost its URL. It had been green locally for months.
->
-> An earlier run failed the same way: the Windows named-pipe path was missing its
-> `io::Write` import, which no Linux build can see because the function is
-> `#[cfg(windows)]`, and would have failed to compile for every Windows user.
+>   cannot isolate it, so cargo's parallel threads overwrote each other and
+>   `test` reported registered before anything had been installed.
+> * Linux: the argv-recording test waited for a file to *exist* rather than to
+>   be finished, so on a loaded runner it read a half-written argv and reported
+>   a link that had lost its URL. It had been green locally for months.
+> * Windows: the named-pipe path was missing its `io::Write` import, which no
+>   Linux build can see because the function is `#[cfg(windows)]`, and would
+>   have failed to compile for every Windows user.
+
+### The Linux binary
+
+`.github/workflows/release.yml` builds a release artifact. It is triggered by
+pushing a tag matching `v*`; it does not create tags, and a manual run
+(`workflow_dispatch`) builds the same artifact and uploads it **without**
+publishing a release, so the pipeline can be proved before anyone cuts a
+version.
+
+```sh
+cargo build --release --target x86_64-unknown-linux-musl
+```
+
+**Static, musl, not glibc.** The glibc build of this crate links
+`GLIBC_2.39` and will not start on Ubuntu 22.04 (2.35), Debian 12 (2.36), or
+anything older: `version 'GLIBC_2.39' not found`, for a program that would have
+run. nxmproxy needs no C library facility musl lacks - no NSS, no locale
+collation, no `dlopen`, no host lookup beyond `$HOME` and `$XDG_*` - so the
+release binary links nothing and runs on any Linux distribution, of any age,
+glibc or musl. The cost is about 400 KB.
+
+The job refuses to publish a binary that links a shared library, and runs the
+artifact inside a container that has **no glibc at all** (`alpine`,
+`--network=none`) before it will attach it. A binary that compiled is not a
+binary that runs, and the whole point of shipping one is that it runs on a
+machine the author has never seen.
+
+Each release carries `LICENSE.md` and `NOTICE.md` beside the binary and states
+the licence and upstream attribution in its notes, because GPL-3 obligations
+travel with a distributed binary and upstream's credit is part of this fork.
 
 ### Negative controls
 
@@ -580,6 +638,9 @@ red. The controls are mutation-and-observe, not assertion-counting:
 | 11 | detection accepts an `Exec` line with no `%1` | `install_refuses_a_manager_it_could_not_use` |
 | 12 | detection fires on a configuration the user built | `install_refuses_a_manager_it_could_not_use` |
 | 13 | detection registers a manager whose executable does not resolve | `install_refuses_a_manager_it_could_not_use` |
+| 14 | `%u` and `%U` are dropped from the field codes, leaving `%1` alone | `the_desktop_entry_spellings_of_the_field_code_all_substitute`, `a_manager_registered_from_a_desktop_entry_receives_the_link` |
+| 15 | substitution re-scans the text it just wrote, so a URL containing `%u` is substituted into a second time | `substitution_is_one_pass_so_a_url_containing_a_field_code_survives` |
+| 16 | `--` before the argument vector is made mandatory again | `a_manager_registered_from_a_desktop_entry_receives_the_link` |
 
 One control is deliberately reported as **green**, and that is the point of
 running them at all. Breaking `Claim::exit_code` to always return 0 did **not**

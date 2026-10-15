@@ -102,8 +102,13 @@ enum Command {
         name: String,
         /// The executable, a path or a bare command name found on PATH.
         exec: String,
-        /// Arguments after `--`. Put `%1` where the link should go.
-        #[arg(last = true)]
+        /// Arguments for the manager. Put `%1`, `%u` or `%U` where the link goes.
+        ///
+        /// `--` before them still works and still means the same thing. It is
+        /// no longer required: a user registering a manager from its own
+        /// desktop entry types `Exec=` without the separator, and rejecting
+        /// that with exit 2 was the whole complaint.
+        #[arg(allow_hyphen_values = true)]
         args: Vec<String>,
     },
 
@@ -466,7 +471,7 @@ fn print_list(config: &Config, loaded: &config::Loaded, dir: &Path) {
     for (id, manager) in &config.managers {
         let mut notes: Vec<String> = Vec::new();
         if !manager.takes_url() {
-            notes.push("no %1 in its arguments, it would receive no link".to_string());
+            notes.push("no %1, %u or %U in its arguments, it would receive no link".to_string());
         }
         if resolve_exec(&manager.exec).is_none() {
             notes.push("executable not found on this machine".to_string());
@@ -752,8 +757,8 @@ fn run() -> i32 {
                 println!("registered mod manager {name:?}.");
                 if !config.managers[&name].takes_url() {
                     eprintln!(
-                        "warning: {name:?} has no %1 in its arguments, so it will be started but \
-                         given no link. Re-run with `-- %1` in the right position."
+                        "warning: {name:?} has no %1, %u or %U in its arguments, so it will be \
+                         started but given no link. Re-run with the link code in the right position."
                     );
                 }
                 if resolve_exec(&config.managers[&name].exec).is_none() {

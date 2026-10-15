@@ -314,11 +314,17 @@ fn wait_for(path: &Path, needle: &str, budget: Duration) -> bool {
 /// On unix, a script that records the exact argv it was called with, one
 /// argument per line, then a terminator. This is how the quote test proves what
 /// the *target process* receives rather than what our own function intended.
+///
+/// `name` may contain directories, and may contain a space: an executable path
+/// with a space in it is the shape upstream could not express at all.
 #[cfg(unix)]
 fn argv_recorder(sandbox: &Sandbox, name: &str) -> (String, PathBuf) {
     use std::os::unix::fs::PermissionsExt;
     let script = sandbox.root.join(name);
     let out = sandbox.root.join(format!("{name}.argv"));
+    if let Some(parent) = script.parent() {
+        std::fs::create_dir_all(parent).unwrap();
+    }
     std::fs::write(
         &script,
         format!(
@@ -414,6 +420,58 @@ fn a_url_containing_a_quote_reaches_the_manager_byte_for_byte() {
         lines,
         vec!["--flag", link],
         "the url must arrive as exactly one argument, unmodified"
+    );
+}
+
+/// The command line a user actually types. HD2 Arsenal is an Electron AppImage
+/// whose desktop entry reads `Exec=HD2Arsenal --no-sandbox %U`, and the user
+/// copies that vector straight into `register` - no `--` separator, and `%U`
+/// rather than `%1`. Both halves were refused or ignored: the separator was
+/// mandatory, and `%U` substituted nothing, so the manager was started and the
+/// link silently dropped.
+///
+/// The executable is a recorder in a directory whose name contains a space,
+/// because that is upstream's other failure mode and the two must hold at once:
+/// a path with a space in it must not split the argv either.
+#[cfg(unix)]
+#[test]
+fn a_manager_registered_from_a_desktop_entry_receives_the_link() {
+    let sandbox = Sandbox::new("capital-u");
+    let (recorder, argv_file) = argv_recorder(&sandbox, "My Mods/HD2Arsenal");
+    assert!(
+        recorder.contains(' '),
+        "precondition: the executable path has a space in it: {recorder}"
+    );
+
+    // Verbatim, exactly as typed, including the missing separator.
+    let registered = run(
+        &sandbox,
+        &["register", "HD2Arsenal", &recorder, "--no-sandbox", "%U"],
+    );
+    assert_eq!(code(&registered), 0, "{}", stderr(&registered));
+    assert!(
+        !stderr(&registered).contains("given no link"),
+        "a manager holding %U must not be reported as one that never sees a link: {}",
+        stderr(&registered)
+    );
+
+    // A url with a space and a quote in it, because the argv must survive both.
+    let link = "nxm://somegame/mods/1/files/2?title=a b\"c";
+    let delivered = run(&sandbox, &["url", link]);
+    assert_eq!(code(&delivered), 0, "{}", stderr(&delivered));
+    assert!(
+        wait_for(&argv_file, "DONE", Duration::from_secs(10)),
+        "the manager never finished recording its argv: {}",
+        std::fs::read_to_string(&argv_file).unwrap_or_default()
+    );
+
+    let recorded = std::fs::read_to_string(&argv_file).unwrap();
+    let mut lines: Vec<&str> = recorded.lines().collect();
+    assert_eq!(lines.pop(), Some("DONE"), "did not finish: {recorded:?}");
+    assert_eq!(
+        lines,
+        vec!["--no-sandbox", link],
+        "%U must become the link, as exactly one argument, with the flag before it intact"
     );
 }
 

@@ -23,7 +23,13 @@ Upstream's design and its own documentation, including:
 * the pipe-first-then-spawn dispatch order;
 * the temp-file-plus-rename config write;
 * the comparison with Mod Organizer 2's `nxmhandler`, reproduced in `README.md`;
-* the note about `CommandLineToArgvW` and why the token is `%1`, not `%u`.
+* the note about `CommandLineToArgvW` and why the token is substituted into a
+  single argv element rather than into a command string.
+
+This fork additionally accepts `%u` and `%U` beside `%1`, because the token is
+read out of an `Exec` line where those are the spellings that occur, and
+`--` before the argument vector of `register` is optional for the same reason:
+a user copies the vector out of a desktop entry and does not type a separator.
 
 ### What changed
 
