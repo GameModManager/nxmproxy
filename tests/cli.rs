@@ -67,11 +67,17 @@ impl Sandbox {
     }
 
     /// `$XDG_CONFIG_HOME`, where `xdg-mime default` writes the claim.
+    ///
+    /// Linux-only, like the tests that use it. Ungated, clippy rejects the
+    /// whole file as dead code on macOS and Windows, which is exactly the
+    /// cross-platform blind spot this suite exists to close.
+    #[cfg(target_os = "linux")]
     fn xdg_config_home(&self) -> PathBuf {
         self.root.join("home").join(".config")
     }
 
     /// The one file nxmproxy is allowed to write a default into.
+    #[cfg(target_os = "linux")]
     fn mimeapps(&self) -> PathBuf {
         self.xdg_config_home().join("mimeapps.list")
     }
@@ -80,10 +86,15 @@ impl Sandbox {
     /// Linux registration force-propagates into. It is written here on purpose:
     /// an assertion that a file was left alone only proves something when the
     /// file existed and had content worth losing.
+    ///
+    /// Not Linux-gated, because the mod-manager detection test reads it on all
+    /// three platforms - the lookup is plain path arithmetic, so there is no
+    /// per-platform difference to hide.
     fn data_applications(&self) -> PathBuf {
         self.root.join("data").join("applications")
     }
 
+    #[cfg(target_os = "linux")]
     fn kde_mimeapps(&self) -> PathBuf {
         self.xdg_config_home().join("kde-mimeapps.list")
     }
@@ -225,23 +236,33 @@ fn panic_markers(output: &Output) -> Vec<&'static str> {
     .collect()
 }
 
-/// Wait, bounded, for `path` to appear. nxmproxy deliberately does not wait for
-/// the manager it spawns, so the child may land slightly after we exit.
+/// Wait, bounded, for `needle` to appear in `path`.
+///
+/// Waiting for the file to merely **exist** is the bug this replaced. The
+/// recorder appends one line per argument, so a file that exists may still be
+/// half written, and a poll landing in that window reads a truncated argv and
+/// reports a link that lost its URL. It passed locally for months and failed on
+/// a loaded CI runner, which is the worst possible signature. Waiting for the
+/// terminator the script writes last makes the file complete by construction.
 #[cfg(unix)]
-fn wait_for(path: &Path, budget: Duration) -> bool {
+fn wait_for(path: &Path, needle: &str, budget: Duration) -> bool {
     let deadline = Instant::now() + budget;
-    while Instant::now() < deadline {
-        if path.exists() {
-            return true;
+    loop {
+        if let Ok(text) = std::fs::read_to_string(path) {
+            if text.contains(needle) {
+                return true;
+            }
+        }
+        if Instant::now() >= deadline {
+            return false;
         }
         std::thread::sleep(Duration::from_millis(20));
     }
-    path.exists()
 }
 
 /// On unix, a script that records the exact argv it was called with, one
-/// argument per line. This is how the quote test proves what the *target
-/// process* receives rather than what our own function intended.
+/// argument per line, then a terminator. This is how the quote test proves what
+/// the *target process* receives rather than what our own function intended.
 #[cfg(unix)]
 fn argv_recorder(sandbox: &Sandbox, name: &str) -> (String, PathBuf) {
     use std::os::unix::fs::PermissionsExt;
@@ -250,7 +271,9 @@ fn argv_recorder(sandbox: &Sandbox, name: &str) -> (String, PathBuf) {
     std::fs::write(
         &script,
         format!(
-            "#!/bin/sh\nfor a in \"$@\"; do printf '%s\\n' \"$a\" >> '{}'; done\n",
+            "#!/bin/sh\nfor a in \"$@\"; do printf '%s\\n' \"$a\" >> '{}'; done\n\
+             printf 'DONE\\n' >> '{}'\n",
+            out.display(),
             out.display()
         ),
     )
@@ -322,13 +345,20 @@ fn a_url_containing_a_quote_reaches_the_manager_byte_for_byte() {
     let delivered = run(&sandbox, &["url", link]);
     assert_eq!(code(&delivered), 0, "{}", stderr(&delivered));
     assert!(
-        wait_for(&argv_file, Duration::from_secs(10)),
-        "the manager never ran"
+        wait_for(&argv_file, "DONE", Duration::from_secs(10)),
+        "the manager never finished recording its argv: {}",
+        std::fs::read_to_string(&argv_file).unwrap_or_default()
     );
 
-    // One argument per line, so a split url would show up as extra lines.
+    // One argument per line, so a split url would show up as extra lines. The
+    // terminator is dropped: it is the harness's, not the manager's.
     let recorded = std::fs::read_to_string(&argv_file).unwrap();
-    let lines: Vec<&str> = recorded.lines().collect();
+    let mut lines: Vec<&str> = recorded.lines().collect();
+    assert_eq!(
+        lines.pop(),
+        Some("DONE"),
+        "the recording did not finish: {recorded:?}"
+    );
     assert_eq!(
         lines,
         vec!["--flag", link],
