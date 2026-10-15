@@ -114,16 +114,53 @@ enum Command {
 ///
 /// For the GUI, which needs to show a broken entry rather than let the user
 /// discover it when a link silently fails.
+///
+/// On Windows a bare name is resolved through `PATHEXT`, so `vortex` finds
+/// `vortex.exe`. Checking only for an exact file name reported perfectly good
+/// managers as missing, which is what the `exec_exists` flag in `list --json`
+/// would then tell the user.
 fn resolve_exec(exec: &str) -> Option<PathBuf> {
     let as_path = PathBuf::from(exec);
     if as_path.components().count() > 1 {
         return as_path.is_file().then_some(as_path);
     }
-    std::env::var_os("PATH").and_then(|paths| {
-        std::env::split_paths(&paths)
-            .map(|dir| dir.join(exec))
-            .find(|candidate| candidate.is_file())
-    })
+    let paths = std::env::var_os("PATH")?;
+    let extensions = pathext_extensions(std::env::var("PATHEXT").ok());
+
+    for dir in std::env::split_paths(&paths) {
+        let candidate = dir.join(exec);
+        if candidate.is_file() {
+            return Some(candidate);
+        }
+        for extension in &extensions {
+            let mut name = candidate.clone().into_os_string();
+            name.push(extension);
+            let with_extension = PathBuf::from(name);
+            if with_extension.is_file() {
+                return Some(with_extension);
+            }
+        }
+    }
+    None
+}
+
+/// The `PATHEXT` extensions to try, as strings including the leading dot.
+///
+/// Windows' own fallback set is used when `PATHEXT` is unset, which is what
+/// `CreateProcess` does. Pure, so the parsing is testable anywhere.
+fn pathext_extensions(value: Option<String>) -> Vec<String> {
+    let raw = value.unwrap_or_else(|| ".COM;.EXE;.BAT;.CMD".to_string());
+    raw.split(';')
+        .map(str::trim)
+        .filter(|e| !e.is_empty())
+        .map(|e| {
+            if e.starts_with('.') {
+                e.to_string()
+            } else {
+                format!(".{e}")
+            }
+        })
+        .collect()
 }
 
 #[derive(serde::Serialize)]
@@ -531,5 +568,32 @@ mod tests {
             "{present} should resolve on this platform"
         );
         assert!(resolve_exec("nxmproxy-definitely-not-a-real-binary").is_none());
+    }
+
+    #[test]
+    fn pathext_is_parsed_the_way_windows_parses_it() {
+        // The bug this asserts against: ignoring PATHEXT, so a manager
+        // registered as `vortex` was reported missing on Windows even though
+        // `Vortex.exe` was installed and launchable.
+        assert_eq!(
+            pathext_extensions(Some(".COM;.EXE;.BAT;.CMD".to_string())),
+            vec![".COM", ".EXE", ".BAT", ".CMD"]
+        );
+        // Unset falls back to the set CreateProcess itself uses.
+        assert_eq!(
+            pathext_extensions(None),
+            vec![".COM", ".EXE", ".BAT", ".CMD"]
+        );
+        // Trailing separators and stray spaces must not become extensions.
+        assert_eq!(
+            pathext_extensions(Some(".EXE;; .CMD ".to_string())),
+            vec![".EXE", ".CMD"]
+        );
+        // A missing dot is added, or the extension would never match a file.
+        assert_eq!(
+            pathext_extensions(Some("EXE;CMD".to_string())),
+            vec![".EXE", ".CMD"]
+        );
+        assert!(pathext_extensions(Some(String::new())).is_empty());
     }
 }
