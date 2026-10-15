@@ -558,6 +558,15 @@ seconds on their own machine. Local verification is the author's job; CI exists
 for the one thing a single machine cannot do, which is proving the crate
 compiles everywhere at once.
 
+**The trade, stated plainly.** This job used to end with `cargo test` and a CLI
+smoke test, and both of those *executed the built binary* - on macOS and Windows
+as well as on Linux. That was the only run-check nxmproxy's binary ever got on
+those two platforms, and it is given up on purpose. macOS and Windows are
+**compile-only** from here: a change that compiles there but misbehaves when
+run is not caught here. That is the accepted cost of not spending minutes per
+commit, and it is why the claims below are marked unverified rather than
+tested.
+
 > **What the CI build proves on macOS and Windows, precisely:** the crate
 > compiles there, and every load-bearing decision in it is pure - the platform
 > module text, the macOS `LSSetDefaultHandlerForURLScheme` decision, the

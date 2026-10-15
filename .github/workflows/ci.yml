@@ -52,5 +52,13 @@ jobs:
       # macOS offer the bundle, or that reg.exe writes the keys we intend.
       # Those need a real machine and a real click, and are called out as
       # unverified in README.md.
+      #
+      # THE TRADE, stated plainly. This job used to end with `cargo test` and a
+      # CLI smoke test, and both of those EXECUTED the built binary - on macOS
+      # and Windows as well as on Linux. That was the only run-check the binary
+      # ever got on those two platforms. It is deliberately given up: CI builds,
+      # whoever changed the code runs it. So macOS and Windows are compile-only
+      # from here, and a change that compiles there but misbehaves when run is
+      # not caught here. Named rather than quietly dropped.
       - name: Build
         run: cargo build --release
