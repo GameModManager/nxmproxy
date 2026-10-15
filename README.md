@@ -562,21 +562,30 @@ Every CLI test runs in a throwaway config directory and a throwaway
 Every load-bearing test has a mutation control that proves it can actually go
 red. The controls are mutation-and-observe, not assertion-counting:
 
-| Control | Mutation | Test that catches it |
+| # | Mutation | Test that catches it |
 | --- | --- | --- |
 | 1 | `install` force-propagates the claim into all three mimeapps files (GMM's anti-pattern) | `linux_install_claims_the_scheme_in_one_file_and_buries_nobody` |
-| 2 | the claim deletes another mod manager's lines | `the_fallback_claim_path_buries_nobody_either`, `linux_uninstall_removes_only_our_line`, `set_default_ids_leaves_every_other_line_byte_for_byte` |
-| 3 | a claim that needs the user exits 0 | `only_a_verified_claim_exits_zero` |
-| 4 | `Claim::needs_user` reports a verified claim | `windows_never_reports_a_claim_it_could_not_make`, `a_claim_is_never_reported_as_verified` |
-| 5 | the "no manager, so nothing is routed" guard is removed | `install_and_uninstall_round_trip` |
-| 6 | `register-manager` survives as an alias | `the_command_names_are_the_final_surface_and_the_old_ones_are_gone` |
-| 7 | the `$XDG_CONFIG_HOME` fix is removed, restoring `xdg-mime`'s silent no-op | `install_and_uninstall_round_trip` |
-| 8 | detection fires on a configuration the user built | `install_registers_a_manager_it_can_prove_is_present` |
-| 9 | detection registers a manager whose executable does not resolve | `install_registers_a_manager_it_can_prove_is_present` |
-| 10 | detection accepts an `Exec` line with no `%1` | `install_registers_a_manager_it_can_prove_is_present` |
+| 2 | the claim deletes another mod manager's lines | `the_fallback_claim_path_buries_nobody_either` |
+| 3 | `uninstall` deletes another manager's line | `linux_uninstall_removes_only_our_line` |
+| 4 | the file editor drops other lines | `set_default_ids_leaves_every_other_line_byte_for_byte` |
+| 5 | a claim that needs the user exits 0 | `only_a_verified_claim_exits_zero` |
+| 6 | `Claim::needs_user` reports a verified claim | `windows_never_reports_a_claim_it_could_not_make`, `a_claim_is_never_reported_as_verified` |
+| 7 | the "no manager, so nothing is routed" guard is removed | `install_never_calls_a_routing_setup_done` |
+| 8 | `register-manager` survives as an alias | `the_command_names_are_the_final_surface_and_the_old_ones_are_gone` |
+| 9 | the `$XDG_CONFIG_HOME` fix is removed, restoring `xdg-mime`'s silent no-op | `install_and_uninstall_round_trip` |
+| 10 | `present` is satisfied by a desktop entry that merely exists | `a_manager_is_detected_only_when_it_can_be_prove_present` |
+| 11 | detection accepts an `Exec` line with no `%1` | `install_refuses_a_manager_it_could_not_use` |
+| 12 | detection fires on a configuration the user built | `install_refuses_a_manager_it_could_not_use` |
+| 13 | detection registers a manager whose executable does not resolve | `install_registers_a_manager_it_can_prove_is_present` |
 
-Two of these found real bugs while they were being written, which is the point
-of running them:
+One control is deliberately reported as **green**, and that is the point of
+running them at all. Breaking `Claim::exit_code` to always return 0 did **not**
+turn `install` green, because the "no manager, so nothing is routed" guard sets
+exit 3 independently. That is defence in depth working, and it is also a
+reminder that a control only proves what the test it targets actually asserts -
+control 6 above exists for the exit code itself.
+
+The rest found real bugs while they were being written:
 
 * Control 7 reproduced a live defect: `xdg-mime default` exits **0 and writes
   nothing** when `$XDG_CONFIG_HOME` is missing, which is the state of a fresh
@@ -586,8 +595,13 @@ of running them:
   running where the logic lives: with `xdg-mime` installed, `install` delegates
   the edit entirely and nxmproxy's own editor never executes. That left the
   hand-written fallback path - the one used on minimal systems, and the one this
-  project wrote itself - with no end-to-end coverage at all. `the_fallback_claim_path_buries_nobody_either`
-  was added to close it, and control 2 goes red against it now.
+  project wrote itself - with no end-to-end coverage at all.
+  `the_fallback_claim_path_buries_nobody_either` was added to close it, and
+  control 2 goes red against it now.
+* Control 10 caught `list --json` and `install` **disagreeing** about what
+  "present" means: the JSON was satisfied by a desktop entry merely existing,
+  while `install` also required the executable to resolve. Both now share one
+  helper and one bar.
 
 ---
 
