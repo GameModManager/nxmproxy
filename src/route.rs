@@ -14,7 +14,7 @@
 
 use std::process::{Command, Stdio};
 
-use crate::config::{Config, Manager, CATCH_ALL};
+use crate::config::{substitute_url, Config, Manager, CATCH_ALL};
 use crate::logger;
 use crate::pipe;
 
@@ -153,12 +153,13 @@ pub fn domain_of(url: &str) -> Result<String, String> {
 /// produced a different and wrong argument vector. Holding the command as a
 /// vector and touching a single element cannot corrupt it.
 ///
-/// `%u` and `%U` mean the same thing as `%1`; see [`config::substitute_url`].
+/// `%u` and `%U` mean the same thing as `%1`; see
+/// [`crate::config::substitute_url`].
 pub fn spawn_args(manager: &Manager, url: &str) -> (String, Vec<String>) {
     let args = manager
         .args
         .iter()
-        .map(|arg| crate::config::substitute_url(arg, url))
+        .map(|arg| substitute_url(arg, url))
         .collect();
     (manager.exec.clone(), args)
 }
