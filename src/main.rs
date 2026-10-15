@@ -36,7 +36,7 @@ const LIST_SCHEMA_VERSION: u32 = 1;
     about = "Forward Nexus Mods nxm:// links to the mod manager assigned for that game.",
     long_about = "Forward Nexus Mods nxm:// links to the mod manager assigned for that game.\n\n\
                   Take nxm:// with `nxmproxy install`, add a mod manager with\n\
-                  `nxmproxy register <name> <exec> [-- <args>...]`, then assign games with\n\
+                  `nxmproxy register <name> <exec> [<args>...]`, then assign games with\n\
                   `nxmproxy assign <manager> <domain>`. `nxmproxy list` shows the routing table.\n\n\
                   Exit codes:\n  \
                     0  done, and verified\n  \
