@@ -1,6 +1,86 @@
 # Changelog
 
-## Unreleased
+## 0.3.0
+
+Second tagged release of this fork of
+[NXMProxy](https://github.com/TanninOne/nxmproxy) by Tanner Parnell,
+Copyright (c) 2021 Tanner Parnell, GPL-3.0-or-later. The licence text is
+`LICENSE.md`; `NOTICE.md` states what was kept, what was fixed and what was
+removed.
+
+### Added
+
+* **Any mod manager, found by its own declaration.** A manager is detected
+  because its desktop entry carries `MimeType=x-scheme-handler/nxm`, the XDG
+  declaration of "I take nxm links", published by the application itself.
+  Until now only the one entry hardcoded into `src/defaults.rs` could ever be
+  found, so a third-party manager such as HD2Arsenal was undetectable from any
+  input. Detection scans `XDG_DATA_HOME/applications`, every
+  `XDG_DATA_DIRS` entry, `~/.local/share/applications` and
+  `XDG_CONFIG_HOME/applications`.
+* **`discover`.** Finds every manager this machine declares and remembers each
+  one as assigned to no game. Found is not chosen: a remembered manager routes
+  nothing until `assign`, is never offered as one of the choices when the answer
+  is ambiguous, and `resolve` refuses rather than guessing. Safe to re-run - an
+  id that is already known is left exactly as it is, and nothing is ever removed.
+* `list` reports which managers were found and which were chosen. `list --json`
+  is version 3 and carries `managers[].discovered`.
+* **`test` reports a browser that decides `nxm://` for itself.** A Gecko profile
+  keeps its own per-scheme table and consults it *before* the OS, so once `nxm`
+  has an entry there no change to any `mimeapps.list` ever reaches that profile
+  again. Read-only: it names the file and the setting inside it, and the edit is
+  the user's. Chromium has no such list - it only records that a *site* may
+  launch a *scheme* and names no application - so it is not reported.
+* **The `pipe` fast path works on Linux and macOS.** It was documented and did
+  nothing there: the only implementation was upstream's
+  `File::create(r"\\.\pipe\{name}")`, which is Windows-only and returned false
+  everywhere else, so a pipe configured on Linux silently took the spawn path
+  for every link. It is now a **Unix domain socket**, and the whole contract -
+  one write of the URL, then close, no framing, no acknowledgement, the
+  configured address is the whole discovery - is published in README as a
+  versioned thing a third-party manager can implement a listener against.
+* **The fallback is now provable.** Every failure to deliver falls back to
+  spawning, and on Linux a no-listener dispatch measures **1.4 ms** end to end:
+  the socket `connect` to an absent peer fails immediately rather than waiting,
+  which is why this is a socket and not a FIFO - a FIFO's `open(O_WRONLY)`
+  blocks in the kernel until a reader appears, and the OS runs nxmproxy once per
+  clicked link. A crashed manager leaves a stale socket file that reports
+  `ECONNREFUSED`, so liveness needs no heartbeat.
+
+### Fixed
+
+* **`nxmproxy <nxm://url>` works.** The command surface has documented the bare
+  form since 0.2.0 and it did not run: upstream made the link a *subcommand*
+  named `url`, so `nxmproxy nxm://helldivers2/...` was parsed as a subcommand
+  called `nxm://helldivers2/...` and refused with `error: unrecognized
+  subcommand`. Both spellings work now - the bare form, and `url <url>`, which
+  is what the desktop entry nxmproxy publishes invokes and what the surface has
+  always named. Nothing else about the command moved.
+* `Exec=` is read from the `[Desktop Entry]` group and nowhere else. An action
+  group carries its own `Exec=` - HD2Arsenal's `[Desktop Action Uninstall]`
+  runs `AppManager uninstall` - and delivering an nxm link to that asks a
+  package manager to delete the user's mod manager.
+* `Exec=` is parsed quote-aware, so an executable path containing a space is one
+  argument rather than two.
+* `MimeType` is read from any group, because AppImage packaging puts it in an
+  action group rather than in `[Desktop Entry]`, and a strict group-only reader
+  did not see HD2Arsenal at all. The asymmetry is safe: the argv still comes
+  from `[Desktop Entry]`, so a stray `MimeType` can never make an uninstall
+  action something nxmproxy spawns.
+* A duplicated `x-scheme-handler/nxm` is one handler, not two candidates.
+* nxmproxy never detects itself, which `install` would otherwise cause by
+  publishing its own entry before detection runs.
+* `~/.local/bin` is searched when resolving an executable and reported by
+  `list`, but is never a detection source: what is in it says a program runs,
+  not that it takes a link.
+* A manager whose application is uninstalled stays in the list, reported
+  unavailable, instead of silently disappearing from it.
+* The output no longer prints one line per claimed file. The count says how many
+  rows were written; only the refusals get a line each.
+* **The Vortex entry no longer states a pipe as fact.** It read "Also exposes a
+  named pipe: vortex_download", which is upstream's README *example*, not
+  anything verified about Vortex - no evidence was found that Vortex binds one.
+  It now says which of the two it is.
 
 ### Changed
 
@@ -31,91 +111,6 @@
 * **A location that refused the write is named**, with its path and the reason,
   and the header counts the loss. `xdg-mime` exits 0 and writes nothing when the
   target directory is missing, so exit status is not evidence of anything.
-
-### Added
-
-* **`test` reports a browser that decides `nxm://` for itself.** A Gecko profile
-  keeps its own per-scheme table and consults it *before* the OS, so once `nxm`
-  has an entry there no change to any `mimeapps.list` ever reaches that profile
-  again. Read-only: it names the file and the setting inside it, and the edit is
-  the user's. Chromium has no such list - it only records that a *site* may
-  launch a *scheme* and names no application - so it is not reported.
-* **The `pipe` fast path works on Linux and macOS.** It was documented and did
-  nothing there: the only implementation was upstream's
-  `File::create(r"\\.\pipe\{name}")`, which is Windows-only and returned false
-  everywhere else, so a pipe configured on Linux silently took the spawn path
-  for every link. It is now a **Unix domain socket**, and the whole contract -
-  one write of the URL, then close, no framing, no acknowledgement, the
-  configured address is the whole discovery - is published in README as a
-  versioned thing a third-party manager can implement a listener against.
-* **The fallback is now provable.** Every failure to deliver falls back to
-  spawning, and on Linux a no-listener dispatch measures **1.4 ms** end to end:
-  the socket `connect` to an absent peer fails immediately rather than waiting,
-  which is why this is a socket and not a FIFO - a FIFO's `open(O_WRONLY)`
-  blocks in the kernel until a reader appears, and the OS runs nxmproxy once per
-  clicked link. A crashed manager leaves a stale socket file that reports
-  `ECONNREFUSED`, so liveness needs no heartbeat.
-
-### Fixed
-
-* The output no longer prints one line per claimed file. The count says how many
-  rows were written; only the refusals get a line each.
-* **The Vortex entry no longer states a pipe as fact.** It read "Also exposes a
-  named pipe: vortex_download", which is upstream's README *example*, not
-  anything verified about Vortex - no evidence was found that Vortex binds one.
-  It now says which of the two it is.
-
-## 0.3.0
-
-### Added
-
-* **Any mod manager, found by its own declaration.** A manager is detected
-  because its desktop entry carries `MimeType=x-scheme-handler/nxm`, the XDG
-  declaration of "I take nxm links", published by the application itself.
-  Until now only the one entry hardcoded into `src/defaults.rs` could ever be
-  found, so a third-party manager such as HD2Arsenal was undetectable from any
-  input. Detection scans `XDG_DATA_HOME/applications`, every
-  `XDG_DATA_DIRS` entry, `~/.local/share/applications` and
-  `XDG_CONFIG_HOME/applications`.
-* **`discover`.** Finds every manager this machine declares and remembers each
-  one as assigned to no game. Found is not chosen: a remembered manager routes
-  nothing until `assign`, is never offered as one of the choices when the answer
-  is ambiguous, and `resolve` refuses rather than guessing. Safe to re-run - an
-  id that is already known is left exactly as it is, and nothing is ever removed.
-* `list` reports which managers were found and which were chosen. `list --json`
-  is version 3 and carries `managers[].discovered`.
-
-### Fixed
-
-* **`nxmproxy <nxm://url>` works.** The command surface has documented the bare
-  form since 0.2.0 and it did not run: upstream made the link a *subcommand*
-  named `url`, so `nxmproxy nxm://helldivers2/...` was parsed as a subcommand
-  called `nxm://helldivers2/...` and refused with `error: unrecognized
-  subcommand`. Both spellings work now - the bare form, and `url <url>`, which
-  is what the desktop entry nxmproxy publishes invokes and what the surface has
-  always named. Nothing else about the command moved.
-* `Exec=` is read from the `[Desktop Entry]` group and nowhere else. An action
-  group carries its own `Exec=` - HD2Arsenal's `[Desktop Action Uninstall]`
-  runs `AppManager uninstall` - and delivering an nxm link to that asks a
-  package manager to delete the user's mod manager.
-* `Exec=` is parsed quote-aware, so an executable path containing a space is one
-  argument rather than two.
-* `MimeType` is read from any group, because AppImage packaging puts it in an
-  action group rather than in `[Desktop Entry]`, and a strict group-only reader
-  did not see HD2Arsenal at all. The asymmetry is safe: the argv still comes
-  from `[Desktop Entry]`, so a stray `MimeType` can never make an uninstall
-  action something nxmproxy spawns.
-* A duplicated `x-scheme-handler/nxm` is one handler, not two candidates.
-* nxmproxy never detects itself, which `install` would otherwise cause by
-  publishing its own entry before detection runs.
-* `~/.local/bin` is searched when resolving an executable and reported by
-  `list`, but is never a detection source: what is in it says a program runs,
-  not that it takes a link.
-* A manager whose application is uninstalled stays in the list, reported
-  unavailable, instead of silently disappearing from it.
-
-### Changed
-
 * Output trimmed to state. `list` prints the config path, the managers, and the
   games under each manager. The local-bin inventory line, the per-manager
   provenance notes, the closing lesson, the advice under the candidate list and
