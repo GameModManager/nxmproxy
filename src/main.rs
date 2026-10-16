@@ -175,14 +175,16 @@ enum Command {
         game: String,
     },
 
-    /// Give a manager a named pipe to try first, before spawning it.
+    /// Give a manager an address to try first, before spawning it.
     ///
     /// Only useful when the manager is already running and listening; if the
-    /// write fails nxmproxy falls back to spawning the command.
+    /// delivery fails nxmproxy falls back to spawning the command. Inert
+    /// until it is set.
     Pipe {
         /// Name of a registered manager.
         manager: String,
-        /// Pipe name only, not a path. Windows named pipe path.
+        /// Windows: a bare pipe name, which becomes `\\.\pipe\{name}`.
+        /// Elsewhere: the full path of a Unix domain socket.
         pipe: String,
     },
 }

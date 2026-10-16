@@ -40,11 +40,30 @@
   again. Read-only: it names the file and the setting inside it, and the edit is
   the user's. Chromium has no such list - it only records that a *site* may
   launch a *scheme* and names no application - so it is not reported.
+* **The `pipe` fast path works on Linux and macOS.** It was documented and did
+  nothing there: the only implementation was upstream's
+  `File::create(r"\\.\pipe\{name}")`, which is Windows-only and returned false
+  everywhere else, so a pipe configured on Linux silently took the spawn path
+  for every link. It is now a **Unix domain socket**, and the whole contract -
+  one write of the URL, then close, no framing, no acknowledgement, the
+  configured address is the whole discovery - is published in README as a
+  versioned thing a third-party manager can implement a listener against.
+* **The fallback is now provable.** Every failure to deliver falls back to
+  spawning, and on Linux a no-listener dispatch measures **1.4 ms** end to end:
+  the socket `connect` to an absent peer fails immediately rather than waiting,
+  which is why this is a socket and not a FIFO - a FIFO's `open(O_WRONLY)`
+  blocks in the kernel until a reader appears, and the OS runs nxmproxy once per
+  clicked link. A crashed manager leaves a stale socket file that reports
+  `ECONNREFUSED`, so liveness needs no heartbeat.
 
 ### Fixed
 
 * The output no longer prints one line per claimed file. The count says how many
   rows were written; only the refusals get a line each.
+* **The Vortex entry no longer states a pipe as fact.** It read "Also exposes a
+  named pipe: vortex_download", which is upstream's README *example*, not
+  anything verified about Vortex - no evidence was found that Vortex binds one.
+  It now says which of the two it is.
 
 ## 0.3.0
 

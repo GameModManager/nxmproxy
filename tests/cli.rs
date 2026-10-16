@@ -544,6 +544,70 @@ fn a_url_containing_a_quote_reaches_the_manager_byte_for_byte() {
     );
 }
 
+/// 2. A configured address with nobody listening falls back to spawning, at once.
+///
+/// The OS invokes nxmproxy **once per clicked link**, so the two failures that
+/// matter here are severe and both are silent: a link that never reaches the
+/// manager downloads nothing, and an attempt that *waits* for a listener that
+/// is not coming hangs a process per click and leaves a dialog that never
+/// dismisses. Nothing can be made to wait forever by accident here - the
+/// address is a Unix domain socket, so `connect` to an absent path is an
+/// instant `ENOENT`, and the whole point of the test is that nxmproxy then
+/// takes the spawn path.
+///
+/// So the assertion is not "the pipe failed" - it is **that the recorder ran**,
+/// which can only happen by falling through to a spawn, and that the link
+/// arrived there intact. Calling our own delivery function would prove neither:
+/// the wiring from a dispatched link to that function is what is on trial.
+///
+/// The elapsed time is printed rather than merely bounded. "Fast" is the claim,
+/// a claim without a number is a claim without evidence, and the number is the
+/// one a user experiences per click.
+#[cfg(unix)]
+#[test]
+fn a_pipe_with_no_listener_falls_back_to_spawn_at_once() {
+    let sandbox = Sandbox::new("nols");
+    let (recorder, argv_file) = argv_recorder(&sandbox, "recorder.sh");
+    // Never created: nothing binds it, so this is the ordinary "the manager is
+    // not running" case rather than a stale file left by a crash.
+    let absent = sandbox.root.join("absent.sock");
+    assert!(
+        !absent.exists(),
+        "precondition: nothing has created this socket"
+    );
+    let link = "nxm://somegame/mods/1/files/2";
+
+    let registered = run(&sandbox, &["register", "recorder", &recorder, "--", "%1"]);
+    assert_eq!(code(&registered), 0, "{}", stderr(&registered));
+    let piped = run(&sandbox, &["pipe", "recorder", absent.to_str().unwrap()]);
+    assert_eq!(code(&piped), 0, "{}", stderr(&piped));
+
+    let start = Instant::now();
+    let delivered = run(&sandbox, &["url", link]);
+    let elapsed = start.elapsed();
+    assert_eq!(code(&delivered), 0, "{}", stderr(&delivered));
+
+    assert!(
+        wait_for(&argv_file, "DONE", Duration::from_secs(10)),
+        "the manager was never spawned, so a pipe with no listener did not fall \
+         back: {}",
+        std::fs::read_to_string(&argv_file).unwrap_or_default()
+    );
+    let recorded = std::fs::read_to_string(&argv_file).unwrap();
+    let mut lines: Vec<&str> = recorded.lines().collect();
+    assert_eq!(lines.pop(), Some("DONE"), "{recorded:?}");
+    assert_eq!(
+        lines,
+        vec![link],
+        "the fallback must carry the link unchanged"
+    );
+
+    // The whole dispatch, not just the socket attempt: process start, config
+    // read, route, failed connect, spawn. Anything that blocked on the absent
+    // address would have shown up here as the full budget rather than this.
+    eprintln!("no listener: whole dispatch took {elapsed:?} and fell back to spawn");
+}
+
 /// The command line a user actually types. HD2 Arsenal is an Electron AppImage
 /// whose desktop entry reads `Exec=HD2Arsenal --no-sandbox %U`, and the user
 /// copies that vector straight into `register` - no `--` separator, and `%U`

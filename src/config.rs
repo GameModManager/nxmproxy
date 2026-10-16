@@ -95,8 +95,14 @@ pub struct Manager {
     /// Fixed arguments, passed verbatim apart from the link substitution.
     #[serde(default)]
     pub args: Vec<String>,
-    /// Optional named pipe tried before spawning. Windows only; see
-    /// [`crate::pipe`].
+    /// Optional listening address tried before spawning.
+    ///
+    /// A bare pipe name on Windows, which becomes `\\.\pipe\{name}`; the full
+    /// path of a **Unix domain socket** everywhere else. The address is the
+    /// whole discovery mechanism - there is nothing else to look up - and any
+    /// failure to deliver falls back to spawning. See [`crate::pipe`] and
+    /// README "Delivering to an already-running manager", which is the
+    /// versioned contract for implementing a listener.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pipe: Option<String>,
 }
@@ -348,7 +354,7 @@ impl Config {
         Ok(())
     }
 
-    /// Give a manager a named pipe to try before spawning it.
+    /// Give a manager an address to try before spawning it.
     pub fn set_pipe(&mut self, manager_id: &str, pipe: &str) -> Result<(), String> {
         match self.managers.get_mut(manager_id) {
             Some(manager) => {

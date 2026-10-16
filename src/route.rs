@@ -201,8 +201,14 @@ pub fn spawn_args(manager: &Manager, url: &str) -> (String, Vec<String>) {
 
 /// Deliver the link.
 ///
-/// Tries the manager's named pipe first if it has one (a running manager
-/// handles it faster than a cold start), then falls back to spawning.
+/// Tries the manager's listening address first if it has one (a running
+/// manager handles it faster than a cold start), then falls back to spawning.
+///
+/// The fallback is unconditional and is what makes the attempt safe to make on
+/// every single link: the OS runs us once per link, so a failed delivery has
+/// to be both cheap and ordinary, and it has to happen. Every failure of the
+/// fast path is an error rather than a block, which is the property a FIFO
+/// cannot offer - see [`crate::pipe`].
 ///
 /// The child is spawned with all three standard streams nulled and is **never
 /// waited on**: the OS launched us for one uri, and we return as soon as it

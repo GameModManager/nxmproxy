@@ -20,7 +20,7 @@ everything after them is this fork.
 
 The original is credited here, in the licence file, and in the module headers of
 every source file. Upstream's own comparison to MO2's `nxmhandler`, and the notes
-on named pipes, are retained below.
+on delivering to a running manager, are retained below.
 
 ### Why fork rather than write fresh
 
@@ -50,7 +50,7 @@ Every item here is a deliberate change, with the reason.
 | `test_installed` compared the handler exe name to the literal `"nxmproxy.exe"` (`src/main.rs:145`) | Compares against this executable's real path | The literal only ever matched an install with that exact name. |
 | Config read was all-or-nothing | Per item: one invalid entry is dropped with a warning, the rest survive | Same failure as above, at finer grain. |
 | Upstream had **no Linux and no macOS code at all** | Both platforms implemented | 176 of upstream's 560 lines were Win32. |
-| `File::create(r"\\.\pipe\{name}")` on every platform (`src/pipe.rs:3-4`) | Windows only; other platforms return false | On POSIX that is not a special path, it is a **relative file name**, so every forwarded link would have dropped a stray file named `\\.\pipe\<name>` into whatever directory the desktop launched from. |
+| `File::create(r"\\.\pipe\{name}")` on every platform (`src/pipe.rs:3-4`) | Windows: `\\.\pipe\{name}`, unchanged from upstream. Elsewhere: a **Unix domain socket**, `UnixStream::connect` + one `write_all` | On POSIX that is not a special path, it is a **relative file name**, so every forwarded link would have dropped a stray file named `\\.\pipe\<name>` into whatever directory the desktop launched from. The socket is not a cosmetic substitution, though. `connect` to an absent peer fails immediately, which is what makes trying it once per link safe; and a crashed manager's leftover socket file reports `ECONNREFUSED`, so it reads as "not running" without a heartbeat. A FIFO does neither. See "Delivering to an already-running manager". |
 
 ### Added
 
@@ -79,6 +79,12 @@ Every item here is a deliberate change, with the reason.
   that declares nxm handling is stored as a **known, unassigned** manager
   instead, and routes nothing until an `assign` says so. See "Remembering a
   mod manager without choosing it".
+* **The fast path works on Linux and macOS**, not only on Windows. Upstream's
+  `pipe` was a dead configuration everywhere but Windows - a pipe set on Linux
+  silently took the spawn path every time - so the feature was documented and
+  did nothing. It is now a Unix domain socket, and the whole shape of it is
+  published as a **versioned contract** third parties can implement against.
+  See "Delivering to an already-running manager".
 * **Tests and CI.** Upstream had no tests at all.
 * **A release pipeline** producing one static Linux binary, the licence and the
   checksum. See "The Linux binary".
@@ -558,7 +564,7 @@ by declaration.
 | `discover` | Find every mod manager this machine declares and **remember** them, assigned to nothing. Re-runnable. |
 | `list [--json]` | The routing table. `--json` is the machine-readable contract. |
 | `test` | Report whether nxmproxy is registered and who the OS says handles `nxm://`. Exit 0 if registered, 1 if not. |
-| `pipe <manager> <pipe>` | Give a manager a named pipe to try before spawning it. |
+| `pipe <manager> <pipe>` | Give a manager an address to try before spawning it. A Unix domain socket path, or a bare pipe name on Windows. Inert until set. See "Delivering to an already-running manager". |
 | `url <nxm url>`, or bare `<nxm url>` | Forward a link. The bare form is one argument and is what a hand-written or third-party `Exec=nxmproxy %u` hands over; the `url` form is what nxmproxy's own desktop entry invokes. |
 
 `list` prints the routing table and nothing else:
@@ -706,7 +712,7 @@ order). Unknown keys are ignored by readers.
       "name": "Vortex Mod Manager",
       "exec": "C:\\Program Files (x86)\\Black Tree Gaming\\Vortex\\Vortex.exe",
       "args": ["%1"],
-      "note": "Windows default install path. Also exposes a named pipe: vortex_download."
+      "note": "Windows default install path. Upstream's README names `vortex_download` as its pipe - that is an EXAMPLE address, not a verified fact about Vortex, and nothing here has found evidence that Vortex binds it."
     }
   ],
   "declared_managers": [
@@ -938,6 +944,9 @@ red. The controls are mutation-and-observe, not assertion-counting:
 | 35 | a write that fails is reported as `Ok`, the `xdg-mime` silent-no-op | `a_location_that_cannot_be_claimed_is_named_with_the_reason` |
 | 36 | the on-disk discovery of a `$desktop-mimeapps.list` is disabled | `a_desktop_file_that_already_exists_is_claimed_while_another_desktop_runs` |
 | 37 | a browser override stops being reported and `test` exits 0 over it | `test_reports_a_browser_that_decides_nxm_for_itself` |
+| 38 | one byte is added to the delivery - a NUL terminator, a trailing newline, anything | `a_running_listener_receives_the_url_byte_for_byte` |
+| 39 | `try_write_pipe` reports a delivery that never happened, so the link is swallowed and nothing is spawned | `a_pipe_with_no_listener_falls_back_to_spawn_at_once` |
+| 40 | the delivery attempt is made to **wait** - any sleep before the `connect` | `a_listener_that_dies_mid_flight_does_not_wedge_us` |
 
 Controls 29-32 are the ones that matter for the output-shape rules, and all four
 were run before this table was written. 29, 30 and 31 each came back **red on
@@ -1058,23 +1067,147 @@ Retained from upstream:
   separately. NXMProxy has no dependencies beyond a handful of small Rust crates.
 * NXMHandler uses ini files. NXMProxy uses TOML.
 
-## Named pipes
+## Delivering to an already-running manager
+
+> **This is a public contract, version 1.** nxmproxy and third-party managers
+> both implement against it, so it is written to be unambiguous. It will not
+> change shape within 0.x; anything that needs more than a bare URL will be a
+> new version, announced here.
 
 Usually forwarding a download means launching the manager with the link as an
 argument; the manager then works out whether it is already running and uses some
 form of IPC to reach its primary instance. Mod managers running on a JVM,
 JavaScript, .NET or Python runtime pay a noticeable startup cost for that.
 
-A manager that exposes a named pipe can be handed the link directly instead:
+A manager that exposes a local socket can be handed the link directly instead:
 
 ```sh
-nxmproxy pipe vortex vortex_download
+nxmproxy pipe vortex "$XDG_RUNTIME_DIR/gamemodmanager.sock"   # Linux, macOS
+nxmproxy pipe vortex vortex_download                          # Windows
 ```
 
-nxmproxy writes the link and closes the pipe. **If the write fails it falls back
-to spawning the command**, on the assumption the manager is not running yet. That
-also means you get no indication if you mistyped the pipe name. Pipes are a
-Windows mechanism; on other platforms the attempt is skipped.
+Nothing here happens until a manager is configured this way. With no pipe set,
+no socket is opened and the fast path does not exist - the spawn is the whole
+path. **Inert unless you opt in.**
+
+### The wire format
+
+* **One write, then close.** The entire message is the URL's bytes, exactly as
+  they arrived from the browser - not re-encoded, not normalised, not
+  percent-decoded. No length prefix, no framing, no trailing newline, no NUL
+  terminator.
+* **No acknowledgement, and no reply is read.** nxmproxy never waits for one, so
+  a listener must not require a response to make progress.
+* **No read timeout, because nxmproxy has none.** It does not read back, so it
+  cannot block on a listener that never answers. The close is the only
+  "finished" signal, so treat it as the end of the message - which is what MO2
+  does: `multiprocess.cpp` reads what has arrived and then emits `messageSent`.
+
+This is deliberately MO2's shape and MO2's is deliberately fire-and-forget, from
+its `multiprocess.cpp`:
+
+```cpp
+m_Server.listen(s_Key);                       // primary: listen
+socket.connectToServer(s_Key, QIODevice::WriteOnly);   // secondary: connect
+socket.write(message.toUtf8());               // one write
+socket.disconnectFromServer();                // and close
+```
+
+### Being found: the configured address is the whole discovery
+
+There is **no discovery file, no environment variable, and no registry key**.
+A manager is found because the user has already configured its address, so the
+address *is* the discovery. What that address is depends on the platform:
+
+| Platform | What `pipe` holds | How a Qt listener matches it |
+| --- | --- | --- |
+| Linux, macOS | **the full filesystem path** of a Unix domain socket | `QLocalServer::listen()` with that same absolute path |
+| Windows | **a bare pipe name**, which nxmproxy opens as `\\.\pipe\{name}` | `QLocalServer::listen()` with that same bare name |
+
+Qt's own rule makes this work: a `name` that "could also be a path such as
+`/tmp/foo`" on Unix and "a pipe path such as `\\.\pipe\foo`" on Windows is used
+as the address verbatim. So a Qt listener needs no per-platform branch.
+
+Three practical constraints, all of which fail *fast* rather than hanging:
+
+* **`sun_path` is 108 bytes** on Linux, and macOS's `$TMPDIR` is already about 50
+  of them. A path that does not fit fails with `ENAMETOOLONG`, which nxmproxy
+  treats as "not running". `$XDG_RUNTIME_DIR` is the short, correct home for it.
+* **nxmproxy never creates the socket file.** That belongs to the listener: a
+  file nxmproxy created would read as "listening" to every later attempt while
+  nothing was there.
+* **Permissions are the listener's.** nxmproxy connects as the user who clicked
+  the link. On Linux, socket access follows the filesystem and the umask unless
+  the listener sets `QLocalServer::UserAccessOption` before `listen()`.
+
+### What a listener must do when it starts
+
+On Unix, closing a listening socket does **not** unlink its file, so a manager
+that crashed leaves a stale socket behind. That is exactly what the fallback is
+for - see below - but it also means a restarting listener cannot `listen()` over
+its own corpse. Qt reports that as `AddressInUseError`, and the fix is Qt's own
+`removeServer()`:
+
+```cpp
+m_Server.setSocketOptions(QLocalServer::UserAccessOption);
+if (!m_Server.listen(m_SocketPath) && m_Server.serverError() == QLocalServer::AddressInUseError) {
+    QLocalServer::removeServer(m_SocketPath);   // a previous run died
+    m_Server.listen(m_SocketPath);              // Qt: "the file should first be removed"
+}
+```
+
+This is the listener's cleanup and **nxmproxy never does it** - deleting a path
+another process may be actively listening on is a race nxmproxy must not enter.
+
+### The fallback, which is the safety argument
+
+**Any failure to deliver falls back to spawning the command**, on the assumption
+the manager is not running yet:
+
+| Situation | What nxmproxy does | Why it cannot hang |
+| --- | --- | --- |
+| No pipe configured | spawns | nothing is opened at all |
+| Path does not exist | spawns | `connect` returns `ENOENT` immediately |
+| Manager crashed, stale socket file left | spawns | `connect` returns `ECONNREFUSED` immediately |
+| Manager connected and closed mid-write | spawns | the write returns an error, not a signal |
+
+The third row is the reason this is a Unix socket and **not a named FIFO**.
+`open(O_WRONLY)` on a FIFO blocks in the kernel until a reader appears, and no
+timeout can help, because the wait is inside the open call. The OS invokes
+nxmproxy **once per clicked link**, so that is one wedged process per click and a
+dialog that never dismisses. A crashed FIFO is worse still: the manager is gone,
+nothing will ever read it, and the file cannot be told apart from one that is
+merely not started yet - so there is no fallback to take.
+
+A socket has neither problem. `connect(2)` cannot block on an absent peer, and a
+stale file reports `ECONNREFUSED`, which reads exactly as "not running".
+
+### Verifying a listener
+
+Any listener will do; no library is needed to check the contract:
+
+```sh
+socat -u UNIX-LISTEN:"$XDG_RUNTIME_DIR/gamemodmanager.sock" - &
+nxmproxy url 'nxm://skyrimse/mods/1/files/2?a="b"&c=d'
+# socat prints: nxm://skyrimse/mods/1/files/2?a="b"&c=d
+```
+
+### The Windows arm: what is real and what is not
+
+Stated plainly, because the honest answer is not symmetrical:
+
+* **Implemented, and byte-compatible with a Qt `QLocalServer` on Windows**: the
+  `\\.\pipe\{name}` write is upstream's, unchanged since 2021, and Qt maps a bare
+  name to the same path. A Windows listener written against `QLocalServer` will
+  match it.
+* **Never executed by a test, anywhere.** CI builds Windows and does not run the
+  suite there, so "it compiles" is the entire claim, and it is not the same
+  claim. Nothing in this repository has ever watched a link arrive over a Windows
+  named pipe.
+* **Inherited and unfixed**: that write is `write`, not `write_all`, so a short
+  write would hand the listener a truncated URL. It is upstream's behaviour,
+  left alone rather than changed blind on a platform this project cannot test.
+  The Unix arm does use `write_all`.
 
 ---
 

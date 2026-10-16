@@ -58,7 +58,9 @@ pub const KNOWN: &[Known] = &[
         name: "Vortex Mod Manager",
         exec: r"C:\Program Files (x86)\Black Tree Gaming\Vortex\Vortex.exe",
         args: &["%1"],
-        note: "Windows default install path. Also exposes a named pipe: vortex_download.",
+        note: "Windows default install path. Upstream's README names `vortex_download` \
+               as its pipe - that is an EXAMPLE address, not a verified fact about \
+               Vortex, and nothing here has found evidence that Vortex binds it.",
         desktop: None,
     },
     Known {
