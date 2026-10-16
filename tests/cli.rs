@@ -186,7 +186,10 @@ fn run(sandbox: &Sandbox, args: &[&str]) -> Output {
 /// only way to ask "what does the sweep do on a machine that is not running the
 /// desktop it is claiming for" is to change it. Every test pins `KDE` by
 /// default, which is exactly what hid the discovery path.
-#[cfg(target_os = "linux")]
+///
+/// Ungated: it is [`run`] with a parameter, and gating it left `run` - which
+/// every cross-platform test calls - pointing at a function that does not exist
+/// on macOS or Windows.
 fn run_on_desktop(sandbox: &Sandbox, desktop: &str, args: &[&str]) -> Output {
     Command::new(BIN)
         .args(args)
