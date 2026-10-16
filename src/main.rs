@@ -9,17 +9,19 @@
 //! MO2's author's original Windows-only router. See README "Divergences from
 //! upstream" for what was kept, what was fixed, and what was removed.
 
+mod browser;
 mod config;
 mod defaults;
 mod logger;
 mod pipe;
 mod platform;
 mod route;
+mod xdg;
 
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
-use clap::{Parser, Subcommand};
+use clap::{CommandFactory, Parser, Subcommand};
 
 use config::{Config, Manager};
 use platform::Status;
@@ -27,7 +29,7 @@ use route::Route;
 
 /// Bumped when the `list --json` shape changes, so a GUI can refuse a format
 /// it does not understand instead of misreading it.
-const LIST_SCHEMA_VERSION: u32 = 1;
+const LIST_SCHEMA_VERSION: u32 = 5;
 
 #[derive(Parser, Debug)]
 #[command(
@@ -44,16 +46,32 @@ const LIST_SCHEMA_VERSION: u32 = 1;
                     2  bad command line\n  \
                     3  registered, but the OS requires one step you must do by hand\n\
                        (the message says which). Nothing failed; nxmproxy did all the\n\
-                       platform allows."
+                       platform allows.",
+    args_conflicts_with_subcommands = true
 )]
 struct Cli {
+    /// An nxm:// link to forward. The same command as `nxmproxy url <url>`.
+    ///
+    /// This is the form the changelog has always documented and the form a
+    /// hand-written or third-party `Exec=nxmproxy %u` hands over. Upstream made
+    /// the link a *subcommand* named `url`, so `nxmproxy nxm://...` was parsed
+    /// as a subcommand called `nxm://...` and refused with
+    /// "unrecognized subcommand" - a surface its own documentation contradicts.
+    /// Both spellings work now: clap gives the subcommand priority when the
+    /// first word names one, and fills this positional when it does not.
+    url: Option<String>,
+
     #[command(subcommand)]
-    command: Command,
+    command: Option<Command>,
 }
 
 #[derive(Subcommand, Debug)]
 enum Command {
     /// Forward an nxm:// link to the mod manager assigned for its game.
+    ///
+    /// An alias for the bare `nxmproxy <nxm://url>`, kept because this is the
+    /// form the desktop entry nxmproxy publishes uses, and because it is what
+    /// the surface has always said this subcommand is.
     Url {
         /// The nxm:// link to forward.
         url: String,
@@ -66,8 +84,10 @@ enum Command {
     /// make it the handler for `nxm://`. How hard that second half can push
     /// depends on the platform, and `install` never reports more than it did:
     ///
-    /// * Linux - writes one `[Default Applications]` line with `xdg-mime`, and
-    ///   `uninstall` takes that line back out.
+    /// * Linux - writes one `[Default Applications]` line into **every** file
+    ///   the specification's lookup order passes through, desktop-specific
+    ///   (`kde-mimeapps.list` and the rest) and plain alike, and confirms each
+    ///   write by reading it back. `uninstall` takes every one of them out.
     /// * macOS - calls LaunchServices, which on macOS 12+ asks you first.
     /// * Windows - **cannot** choose the default app; no program may. It opens
     ///   the Default Apps page for you instead and exits 3.
@@ -77,12 +97,38 @@ enum Command {
 
     /// Remove nxmproxy as the nxm:// handler, and undo what `install` published.
     ///
-    /// Symmetric with `install`. Linux removes nxmproxy's own
-    /// `[Default Applications]` line and touches no other manager's entry.
+    /// Symmetric with `install`, location for location. Linux removes nxmproxy's
+    /// own id from every `[Default Applications]` line it added and leaves every
+    /// other id, in every other file, exactly where it was; a file that held
+    /// nothing but nxmproxy's own line is removed rather than left empty.
     Uninstall,
 
-    /// Report whether nxmproxy is registered, and who the OS says handles nxm://.
+    /// Report whether nxmproxy is registered, and who opens nxm://.
+    ///
+    /// Three answers, because there are three decisions. The OS's - the whole
+    /// `mimeapps.list` chain including the `$desktop-mimeapps.list` files, which
+    /// is everything `install` can affect - and any browser that decides for
+    /// itself and never asks the OS. A machine can pass the first and fail the
+    /// second, and that is the state a user cannot see from either answer alone.
     Test,
+
+    /// Find every mod manager this machine declares, and remember them.
+    ///
+    /// An application is found because its own desktop entry says
+    /// `MimeType=x-scheme-handler/nxm` - the XDG declaration of "I take nxm
+    /// links", published by the application itself. HD2Arsenal is the case this
+    /// exists for: a third-party manager, absent from any list we ship.
+    ///
+    /// **Found is not chosen.** Every manager it stores is assigned to nothing,
+    /// and routes nothing, until you `assign` it. Silently routing a link into
+    /// an application you never picked is the one thing this program must not
+    /// do, so nothing is ever registered *and* routed in the same step.
+    ///
+    /// Safe to run as often as you like: it never changes a manager you
+    /// already have, never removes one whose application has been uninstalled
+    /// (it is marked unavailable instead), and never picks between candidates.
+    /// Run it again after installing a mod manager or a game.
+    Discover,
 
     /// Show the routing table. `--json` is the machine-readable contract.
     List {
@@ -129,14 +175,16 @@ enum Command {
         game: String,
     },
 
-    /// Give a manager a named pipe to try first, before spawning it.
+    /// Give a manager an address to try first, before spawning it.
     ///
     /// Only useful when the manager is already running and listening; if the
-    /// write fails nxmproxy falls back to spawning the command.
+    /// delivery fails nxmproxy falls back to spawning the command. Inert
+    /// until it is set.
     Pipe {
         /// Name of a registered manager.
         manager: String,
-        /// Pipe name only, not a path. Windows named pipe path.
+        /// Windows: a bare pipe name, which becomes `\\.\pipe\{name}`.
+        /// Elsewhere: the full path of a Unix domain socket.
         pipe: String,
     },
 }
@@ -155,10 +203,23 @@ fn resolve_exec(exec: &str) -> Option<PathBuf> {
     if as_path.components().count() > 1 {
         return as_path.is_file().then_some(as_path);
     }
-    let paths = std::env::var_os("PATH")?;
+    let mut dirs: Vec<PathBuf> = std::env::var_os("PATH")
+        .map(|paths| std::env::split_paths(&paths).collect())
+        .unwrap_or_default();
+    // `$XDG_BIN_HOME`, else `~/.local/bin`. Installer-managed apps drop a
+    // symlink there for every app they own - `hd2arsenal ->
+    // ~/Applications/HD2Arsenal` on the machine this was written for - so this
+    // is where an `Exec=` name usually lives. Listing it explicitly rather than
+    // trusting `PATH` is what makes it work under a shell profile that never
+    // set `PATH`.
+    if let Some(bin) = xdg::local_bin() {
+        if !dirs.contains(&bin) {
+            dirs.push(bin);
+        }
+    }
     let extensions = pathext_extensions(std::env::var("PATHEXT").ok());
 
-    for dir in std::env::split_paths(&paths) {
+    for dir in dirs {
         let candidate = dir.join(exec);
         if candidate.is_file() {
             return Some(candidate);
@@ -205,6 +266,11 @@ struct JsonManager<'a> {
     takes_url: bool,
     /// False when the executable cannot be found on this machine.
     exec_exists: bool,
+    /// True when discovery found this manager on this machine and nobody
+    /// chose it. A GUI must present it as a suggestion, never as the one that
+    /// is set up: nxmproxy itself refuses to route to one of these until a
+    /// game is assigned to it.
+    discovered: bool,
 }
 
 #[derive(serde::Serialize)]
@@ -228,6 +294,20 @@ struct JsonKnownManager {
 }
 
 #[derive(serde::Serialize)]
+struct JsonDeclaredManager {
+    id: String,
+    name: String,
+    /// The desktop entry that declared it, so a GUI can say where it found it
+    /// rather than presenting a bare command as magic.
+    entry: String,
+    /// The MIME types that entry declares, deduplicated. The one that matched
+    /// is `x-scheme-handler/nxm`.
+    mime_types: Vec<String>,
+    exec: String,
+    args: Vec<String>,
+}
+
+#[derive(serde::Serialize)]
 struct JsonList<'a> {
     version: u32,
     config_path: String,
@@ -238,6 +318,44 @@ struct JsonList<'a> {
     managers: Vec<JsonManager<'a>>,
     assignments: Vec<JsonAssignment<'a>>,
     known_managers: &'static [JsonKnownManager],
+    /// Applications found by their own `x-scheme-handler/nxm` declaration that
+    /// the curated list above could never contain, because we did not know they
+    /// existed. HD2Arsenal is the case this exists for.
+    ///
+    /// This is a **live** scan of the desktop directories, independent of the
+    /// config: it reports what is there now, including managers `discover`
+    /// never stored because one already had that id. A GUI offers these for
+    /// one-click registration; a user who has already run `discover` reads
+    /// `managers[].discovered` instead.
+    declared_managers: Vec<JsonDeclaredManager>,
+    /// What the OS says handles `nxm://`, or `null` when nothing claims it.
+    ///
+    /// From the same read `nxmproxy test` prints, so a GUI cannot report a
+    /// different answer from the CLI.
+    handler: Option<String>,
+    /// True when **nxmproxy** is that handler.
+    ///
+    /// The field that stops the false green. Everything above describes
+    /// capability - a published entry, a registered manager, an assignment -
+    /// and a GUI that renders all of it green while nxmproxy is bypassed shows
+    /// the user a working install over one that routes nothing. This is the
+    /// single fact that distinguishes them, and it is the same one `test`
+    /// exits on.
+    owns_scheme: bool,
+    /// The whole resolution, in the order the OS considered it.
+    ///
+    /// Not a summary of `handler`: this is the evidence behind it. Every
+    /// declaration with **the file it came from and the group it is in**, plus
+    /// the rule that made `declarations[0]` the winner. A GUI that renders
+    /// `owns_scheme: false` next to nothing else leaves the user in exactly the
+    /// position this change was made to end - knowing nxmproxy lost, with no
+    /// way to see who beat it or where they said so.
+    ///
+    /// A contest is two or more distinct `ids` across `declarations`; the first
+    /// `ids` entry of each is the application that would get the link. There is
+    /// no precomputed `conflicting` flag because it is one comparison, and a
+    /// derived field is one more thing that can disagree with the data.
+    scheme: platform::Resolution,
     warnings: &'a [String],
 }
 
@@ -314,27 +432,56 @@ fn exec_line_of(entry: &str) -> Option<String> {
 }
 
 /// A manager that is actually installed here, and how to invoke it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Candidate {
+    /// The id `register` would give it.
+    pub id: String,
+    pub name: String,
+    pub manager: Manager,
+}
+
+/// An id for a manager we have no curated entry for: its `Name=`, lowercased
+/// and reduced to characters a user can type.
+///
+/// "HD2Arsenal" becomes `hd2arsenal`, which is what the user would have
+/// guessed, so the command we print is the command they would have written.
+fn id_for(name: &str) -> String {
+    let mut id = String::with_capacity(name.len());
+    for ch in name.chars() {
+        if ch.is_alphanumeric() {
+            id.extend(ch.to_lowercase());
+        } else if !id.ends_with('-') {
+            id.push('-');
+        }
+    }
+    id.trim_matches('-').to_string()
+}
+
+/// Every manager this machine can prove it has, from both sources.
 ///
 /// Two sources, in order of trust:
 ///
-/// 1. **The manager's own XDG desktop entry**, when it has one. That file is
-///    written by the manager itself and holds its real `Exec=` line, so reading
-///    it requires no guess at all. This is the only thing that works for GameMod
-///    Manager on Linux: QtIFW installs it to a prefix that is **not** on `PATH`,
-///    so `resolve_exec("gamemodmanager")` finds nothing on a machine where GMM is
-///    plainly installed, while the desktop entry exists and names the binary.
-/// 2. **`PATH`**, for everything else.
+/// 1. **The application's own XDG desktop entry**, when it declares
+///    `x-scheme-handler/nxm`. That is the XDG declaration of "I take nxm
+///    links", published by the application itself and read by the desktop to
+///    route links, and it needs no knowledge of the application at all. This is
+///    what finds HD2Arsenal, and any third-party manager published the same
+///    way - the curated list below could never find one, because a third-party
+///    app never appears in our own list.
+/// 2. **The curated list**, by its desktop file where it has one and `PATH`
+///    otherwise. This is what catches a manager with no desktop entry at all.
 ///
-/// A candidate is accepted only when the resulting executable really resolves.
-/// Registering a manager that cannot be started would produce exactly the broken
-/// install this exists to prevent, so an unresolvable candidate is a refusal
-/// rather than a warning. Refusing is safe: the caller prints the command to type.
+/// A candidate is accepted only when the resulting executable really resolves
+/// and its argv really receives the link. Registering a manager that cannot be
+/// started, or that is started and handed nothing, is exactly the broken
+/// install this exists to prevent - so an unusable candidate is dropped and the
+/// caller prints the command to type instead.
 ///
-/// Only ever consulted when the configuration has **no** managers at all, and
-/// only ever returns a single one. A user who configured something has already
-/// answered this question.
-pub fn detect_manager() -> Option<(&'static defaults::Known, Manager)> {
-    let candidates: Vec<(&'static defaults::Known, Manager)> = defaults::KNOWN
+/// Duplicates are collapsed on the invocation, not on the name: one program
+/// described by two desktop files in two directories is one manager, and
+/// counting it twice would manufacture an ambiguity out of a single app.
+pub fn detect_candidates() -> Vec<Candidate> {
+    let mut candidates: Vec<Candidate> = defaults::KNOWN
         .iter()
         .filter_map(|known| {
             let from_entry =
@@ -360,16 +507,60 @@ pub fn detect_manager() -> Option<(&'static defaults::Known, Manager)> {
                 },
                 None => return None,
             };
-            Some((known, manager))
+            Some(Candidate {
+                id: known.id.to_string(),
+                name: known.name.to_string(),
+                manager,
+            })
         })
         .collect();
 
-    // Exactly one, or none. Two managers installed is genuinely ambiguous and
-    // guessing routes downloads to the wrong mod queue, which is the failure
-    // `Route::Ambiguous` exists to refuse at click time. `install` must not
-    // invent the very ambiguity it refuses to resolve later.
-    match candidates.as_slice() {
-        [(only, manager)] => Some((*only, manager.clone())),
+    for declared in declared_candidates() {
+        // The same application reached by both routes is one manager, and the
+        // curated entry keeps the documented id.
+        if candidates
+            .iter()
+            .any(|seen| seen.manager == declared.manager)
+        {
+            continue;
+        }
+        candidates.push(declared);
+    }
+
+    candidates
+}
+
+/// Candidates that came from an application's **own** nxm declaration.
+///
+/// The third-party finds, which [`defaults::KNOWN`] cannot contain by
+/// construction: a manager we never heard of has no entry in our curated list,
+/// and that is the entire class of application this covers. `list --json`
+/// reports them separately so a GUI can offer them as a one-click register.
+fn declared_candidates() -> Vec<Candidate> {
+    xdg::declared()
+        .into_iter()
+        .filter(|declared| {
+            resolve_exec(&declared.manager.exec).is_some()
+                && declared.manager.args.iter().any(|arg| arg == "%1")
+        })
+        .map(|declared| Candidate {
+            id: id_for(&declared.name),
+            name: declared.name,
+            manager: declared.manager,
+        })
+        .collect()
+}
+
+/// The one manager `install` may register on the user's behalf, or `None`.
+///
+/// Exactly one or nothing. Two managers installed is genuinely ambiguous and
+/// guessing routes downloads to the wrong mod queue, which is the failure
+/// `Route::Ambiguous` exists to refuse at click time. `install` must not
+/// invent the very ambiguity it refuses to resolve later - and it must not
+/// pick the "nicer looking" one either, so there is no preference to express.
+fn sole_candidate(candidates: &[Candidate]) -> Option<&Candidate> {
+    match candidates {
+        [only] => Some(only),
         _ => None,
     }
 }
@@ -426,6 +617,13 @@ fn known_managers_json() -> &'static [JsonKnownManager] {
 }
 
 fn list_json(config: &Config, loaded: &config::Loaded, dir: &Path) -> String {
+    // The same read, through the same predicate, that `install` verifies with
+    // and `test` exits on. `list` is exempt from no rule: a JSON contract that
+    // could render a false green is the exact failure this field exists to
+    // stop, so a GUI reading it cannot end up greener than the terminal.
+    let resolution = scheme_ownership();
+    let handler = resolution.handler();
+    let owns = resolution.owns();
     let payload = JsonList {
         version: LIST_SCHEMA_VERSION,
         config_path: dir.join(config::CONFIG_FILE).to_string_lossy().into_owned(),
@@ -440,6 +638,7 @@ fn list_json(config: &Config, loaded: &config::Loaded, dir: &Path) -> String {
                 pipe: manager.pipe.as_deref(),
                 takes_url: manager.takes_url(),
                 exec_exists: resolve_exec(&manager.exec).is_some(),
+                discovered: config.discovered.contains(id),
             })
             .collect(),
         assignments: config
@@ -448,74 +647,298 @@ fn list_json(config: &Config, loaded: &config::Loaded, dir: &Path) -> String {
             .map(|(domain, manager)| JsonAssignment { domain, manager })
             .collect(),
         known_managers: known_managers_json(),
+        declared_managers: xdg::declared()
+            .into_iter()
+            .filter(|declared| {
+                resolve_exec(&declared.manager.exec).is_some()
+                    && declared.manager.args.iter().any(|arg| arg == "%1")
+            })
+            .map(|declared| JsonDeclaredManager {
+                id: id_for(&declared.name),
+                entry: declared.entry.to_string_lossy().into_owned(),
+                exec: declared.manager.exec,
+                args: declared.manager.args,
+                name: declared.name,
+                mime_types: declared.mime_types,
+            })
+            .collect(),
         warnings: &loaded.warnings,
+        handler,
+        owns_scheme: owns,
+        scheme: resolution,
     };
     // BTreeMaps plus declared field order make this byte stable across runs.
     serde_json::to_string_pretty(&payload).expect("the list payload is all owned, printable data")
 }
 
+/// The exact command a user types to register `candidate`.
+///
+/// Quoted where it has to be, because the single most common reason this
+/// project's users are here is a path with a space in it - and an unquoted
+/// command we print is a command that does not work.
+fn register_command(candidate: &Candidate) -> String {
+    fn quote(value: &str) -> String {
+        if value.contains(char::is_whitespace) {
+            format!("\"{value}\"")
+        } else {
+            value.to_string()
+        }
+    }
+    std::iter::once("nxmproxy".to_string())
+        .chain([
+            "register".to_string(),
+            candidate.id.clone(),
+            quote(&candidate.manager.exec),
+        ])
+        .chain(candidate.manager.args.iter().map(|a| quote(a)))
+        .collect::<Vec<String>>()
+        .join(" ")
+}
+
+/// Applications that declared nxm handling but cannot be used, as a line a user
+/// can act on.
+///
+/// Dropping them in silence is the one thing worse than refusing them: there
+/// is an entry on disk declaring the application handles nxm, nxmproxy found
+/// nothing, and the message says there is nothing to be found.
+fn unusable_declarations() -> Vec<String> {
+    xdg::declared()
+        .into_iter()
+        .filter(|declared| resolve_exec(&declared.manager.exec).is_none())
+        .map(|declared| {
+            format!(
+                "{} ({}) - not on this machine",
+                declared.name, declared.manager.exec
+            )
+        })
+        .collect()
+}
+
+/// Print what this machine has, and the command that registers each one.
+///
+/// A candidate list and a choice, never a choice made for the user: routing an
+/// nxm link into the wrong mod manager puts a download in somebody else's
+/// queue, which is worse than not routing it at all.
+///
+/// The register command is the one command worth printing. It is not advice -
+/// it is this machine's own path and argv, which exist nowhere else and which
+/// `xdg-mime`/a desktop-entry file would otherwise take a human to reconstruct.
+/// Every *other* command is in `--help`, where it belongs.
+fn print_candidates(candidates: &[Candidate]) {
+    let refused = unusable_declarations();
+    if candidates.is_empty() {
+        println!("no mod manager registered, and none found on this machine.");
+        print_refused(&refused);
+        return;
+    }
+
+    let count = candidates.len();
+    println!(
+        "{count} application{} on this machine {} nxm://:",
+        if count == 1 { "" } else { "s" },
+        if count == 1 { "declares" } else { "declare" }
+    );
+    for candidate in candidates {
+        println!("    {}", register_command(candidate));
+    }
+    print_refused(&refused);
+}
+
+/// Applications we found and would not use, named, with the reason.
+///
+/// The path this takes matters: the common case for an entry being refused is
+/// a *partly* working install, and "nothing found" for a user who can see the
+/// desktop entry would be a lie.
+fn print_refused(refused: &[String]) {
+    if refused.is_empty() {
+        return;
+    }
+    println!("unusable:");
+    for line in refused {
+        println!("  {line}");
+    }
+}
+
+/// Remember every manager this machine declares, assigned to nothing.
+///
+/// Only [`declared_candidates`] feeds this - the applications whose **own**
+/// desktop entry declares `x-scheme-handler/nxm`. The curated list in
+/// [`defaults`] is deliberately left out: it is a list of guesses about
+/// executable names, and writing guesses into the user's database is the thing
+/// the declaration-based detection exists to avoid.
+///
+/// Both guards detection already applies are inherited by calling it rather than
+/// reimplementing it: a candidate whose executable does not resolve, or whose
+/// argv would receive no link, is never a candidate and is never stored.
+///
+/// Re-runnable by construction: [`Config::discover_manager`] refuses to touch an
+/// id that is already known, so running this twice, or after a `register` or an
+/// `assign`, changes nothing that was already there.
+fn discover_managers(config: &mut Config) -> Vec<String> {
+    let mut added = Vec::new();
+    for candidate in declared_candidates() {
+        // The "already known" decision lives in `Config::discover_manager` and
+        // nowhere else. A second copy of it here was written first, and a
+        // mutation of that copy left the suite green - which is what a
+        // duplicated guard buys.
+        match config.discover_manager(&candidate.id, candidate.manager.clone()) {
+            Ok(true) => added.push(format!("{} ({})", candidate.name, candidate.id)),
+            Ok(false) => {}
+            // A refused registration is reported, never swallowed: it means a
+            // candidate exists that we could not store, and silence would make
+            // the count of found managers and the count of stored managers
+            // disagree with no explanation.
+            Err(message) => {
+                eprintln!("nxmproxy: could not remember {}: {message}", candidate.name)
+            }
+        }
+    }
+    added
+}
+
+/// Compose `discover`: remember what is on this machine, choose nothing.
+fn handle_discover(config: &mut Config, save: &dyn Fn(&Config) -> i32) -> i32 {
+    let found = declared_candidates();
+    if found.is_empty() {
+        println!("nothing on this machine declares x-scheme-handler/nxm.");
+        print_refused(&unusable_declarations());
+        return 0;
+    }
+
+    let added = discover_managers(config);
+    let code = save(config);
+    if code != 0 {
+        return code;
+    }
+
+    // What was found, and nothing else. What a user does about it is in `--help`;
+    // repeating the assignment recipe here was three commands of lecture per run.
+    if added.is_empty() {
+        println!(
+            "{} mod manager{} already known.",
+            found.len(),
+            if found.len() == 1 { "" } else { "s" }
+        );
+    } else {
+        println!(
+            "found {} mod manager{}:",
+            found.len(),
+            if found.len() == 1 { "" } else { "s" }
+        );
+        for line in &added {
+            println!("  {line}");
+        }
+    }
+
+    print_refused(&unusable_declarations());
+    0
+}
+
+/// The games assigned to `id`, as the `list` table shows them.
+fn games_of(config: &Config, id: &str) -> Vec<String> {
+    config
+        .games
+        .iter()
+        .filter(|(_, assigned)| assigned.as_str() == id)
+        .map(|(domain, _)| {
+            if domain == config::CATCH_ALL {
+                "every unassigned game".to_string()
+            } else {
+                domain.clone()
+            }
+        })
+        .collect()
+}
+
+/// The routing table, in the shape the README documents:
+///
+/// ```text
+/// mod managers:
+///   <id>: <exec> <args>
+///     * <game>
+/// ```
+///
+/// Nothing else. A manager with no `*` line under it routes nothing, which
+/// says "assigned to nothing" without a parenthetical saying so - and saying it
+/// in prose is what this function used to do, four sentences per manager.
+///
+/// Provenance is not shown either: `discovered` is still in `list --json`, and a
+/// manager found by the back door with no games under it is self-evident.
 fn print_list(config: &Config, loaded: &config::Loaded, dir: &Path) {
     println!("config: {}", dir.join(config::CONFIG_FILE).display());
+    // Second line, above the table, because it is the one fact that decides
+    // whether anything in the table is reachable at all: if nxmproxy does not
+    // hold `nxm://`, no assignment below is ever consulted by the desktop.
+    // A routing table printed on its own implies a working setup.
+    //
+    // One line, not the chain. `test` is where the resolution is explained; this
+    // is the verdict only, so `list` stays a table.
+    let resolution = scheme_ownership();
+    let handler = handler_name(&resolution);
+    let foreign = handler != "nothing" && !resolution.owns();
+    println!(
+        "nxm:// handler: {handler}{}",
+        if foreign { " (not nxmproxy)" } else { "" }
+    );
     for warning in &loaded.warnings {
         eprintln!("warning: {warning}");
     }
 
     if config.managers.is_empty() {
-        println!("\nno mod managers registered.");
-        println!("  nxmproxy register vortex /path/to/vortex.exe -- %1");
-        println!("  see `nxmproxy list --json` for a curated list of known managers");
+        println!();
+        print_candidates(&detect_candidates());
         return;
     }
 
     println!("\nmod managers:");
     for (id, manager) in &config.managers {
+        let command = std::iter::once(manager.exec.as_str())
+            .chain(manager.args.iter().map(String::as_str))
+            .collect::<Vec<_>>()
+            .join(" ");
+
+        // Only what the command itself does not already say. A file going
+        // missing is the commonest way a list silently loses an entry, so that
+        // one stays.
         let mut notes: Vec<String> = Vec::new();
         if !manager.takes_url() {
-            notes.push("no %1, %u or %U in its arguments, it would receive no link".to_string());
+            notes.push("no link code".to_string());
         }
         if resolve_exec(&manager.exec).is_none() {
-            notes.push("executable not found on this machine".to_string());
+            notes.push("unavailable".to_string());
         }
         if let Some(pipe) = &manager.pipe {
             notes.push(format!("pipe {pipe}"));
         }
-        let suffix = if notes.is_empty() {
+        let notes = if notes.is_empty() {
             String::new()
         } else {
-            format!("  ({})", notes.join("; "))
+            format!(" ({})", notes.join(", "))
         };
-        println!(
-            "  {id}: {} {}{suffix}",
-            manager.exec,
-            manager.args.join(" ")
-        );
-    }
 
-    println!("\ngames:");
-    if config.games.is_empty() && config.managers.len() > 1 {
-        println!("  none - with more than one manager every game needs an assignment,");
-        println!("  otherwise there is no correct answer and guessing would misroute the link");
-    } else if config.games.is_empty() {
-        println!("  none - every game goes to the only registered manager");
-    } else {
-        for (domain, manager) in &config.games {
-            let label = if domain == config::CATCH_ALL {
-                "_ (every unassigned game)"
-            } else {
-                domain.as_str()
-            };
-            println!("  {label} -> {manager}");
+        println!("  {id}: {command}{notes}");
+        for game in games_of(config, id) {
+            println!("    * {game}");
         }
     }
 }
 
 /// Forward one link. Exit code is the answer: 0 delivered, 1 not.
+///
+/// Four log events, one line each, machine-greppable, covering the whole life of
+/// a link: it arrived, who it resolved to, exactly what argv it went out with,
+/// and whether the spawn took. This is the diagnostic the user asked for, and
+/// it is the only place it can live: the OS launches us with no terminal and we
+/// exit in milliseconds, so when a link does not arrive the reason cannot be
+/// printed to anybody. It has to already be in the file.
 fn handle_url(config: &Config, url: &str) -> i32 {
+    logger::info(format!("link url={url:?}"));
+
     let domain = match route::domain_of(url) {
         Ok(domain) => domain,
         Err(message) => {
             eprintln!("nxmproxy: {message}");
-            logger::error(&message);
+            logger::error(format!("route result=rejected reason={message:?}"));
             return 1;
         }
     };
@@ -524,22 +947,131 @@ fn handle_url(config: &Config, url: &str) -> i32 {
     if let Route::Unhandled { domain, reason } = &route {
         let message = format!("nxmproxy: {}", reason.message(domain));
         eprintln!("{message}");
-        logger::error(&message);
+        logger::error(format!(
+            "route domain={domain:?} manager=none result=unrouted reason={}",
+            reason_tag(reason)
+        ));
         return 1;
     }
 
-    logger::info(format!("routing {url} -> {}", route.domain()));
+    logger::info(format!(
+        "route domain={domain:?} manager={:?} result=routed",
+        // `unwrap_or_default`, not `{:?}` on the Option: `Some("vortex")` in a
+        // `key=value` line is a Rust type leaking into a format that claims to
+        // be greppable, and `manager=Some(` is not a token anyone can match.
+        route.manager_id().unwrap_or_default()
+    ));
     match route::deliver(&route, url) {
         Ok(()) => 0,
         Err(message) => {
             eprintln!("nxmproxy: {message}");
-            logger::error(&message);
+            logger::error(format!(
+                "route domain={domain:?} result=undelivered reason={message:?}"
+            ));
             1
         }
     }
 }
 
+/// The one word a log reader can grep for to say why a domain was unrouted.
+///
+/// [`Reason::message`] is the human sentence and it spans two lines with an
+/// indented command in it, which is not greppable and not one line per event.
+/// The tag carries the same three-way distinction without the prose.
+fn reason_tag(reason: &route::Reason) -> &'static str {
+    match reason {
+        route::Reason::NoManagers => "no-managers",
+        route::Reason::Ambiguous(_) => "ambiguous",
+        route::Reason::Unassigned(_) => "unassigned",
+    }
+}
+
+/// Ask the OS who owns `nxm://`, and write the answer down.
+///
+/// One function for three commands, because three independent readings of the
+/// same question are how they came to disagree: `install` used to decide from
+/// the [`platform::Claim`] it was handed, `test` from `is_registered`, and
+/// `list --json` did not ask at all. They now answer from this.
+///
+/// The log is the point of it as much as the return value. A link that never
+/// arrives leaves no stdout to read - we are launched by the OS with no terminal
+/// and exit in milliseconds - so "who held the scheme when you ran install", and
+/// "which of two declared applications outranked the other", have to be
+/// recoverable afterwards rather than remembered.
+///
+/// One line per declaration and one for the verdict, all machine-greppable: a
+/// reader asking "who owned nxm:// at 14:02" wants `grep '^scheme '`, not a
+/// paragraph.
+fn scheme_ownership() -> platform::Resolution {
+    let resolution = platform::imp::resolve();
+    let owns = resolution.owns();
+    for (rank, declaration) in resolution.declarations.iter().enumerate() {
+        logger::info(format!(
+            "scheme declaration rank={} section={:?} ids={:?} source={:?}",
+            rank + 1,
+            declaration.section,
+            declaration.ids,
+            declaration.source
+        ));
+    }
+    logger::info(format!(
+        "scheme handler={:?} owns={owns} rule={:?}",
+        resolution.handler().unwrap_or_else(|| "none".to_string()),
+        resolution.rule
+    ));
+    if !owns {
+        logger::warn(format!(
+            "nxmproxy does not own nxm://; {} does",
+            resolution
+                .handler()
+                .unwrap_or_else(|| "nothing".to_string())
+        ));
+    }
+    resolution
+}
+
+/// The handler's name for a user, or a word for "nobody".
+fn handler_name(resolution: &platform::Resolution) -> String {
+    resolution
+        .handler()
+        .unwrap_or_else(|| "nothing".to_string())
+}
+
+/// The resolution chain, as the lines a user reads and a test pins.
+///
+/// Every candidate, in the order the OS would consider them, each with **the
+/// group it came from and the file it is in**, then the winner and the rule that
+/// made it the winner. A bare application name could not be checked by hand and
+/// could not tell a real conflict from a ranked list; this can be read against
+/// the file in either direction.
+///
+/// Two facts about *different applications* is its own line, because that is the
+/// state that is indistinguishable from a working setup without it.
+fn print_resolution(resolution: &platform::Resolution) {
+    println!("nxm:// resolution, highest precedence first:");
+    for declaration in &resolution.declarations {
+        println!(
+            "  {:<22} {}  <- {}",
+            declaration.section,
+            declaration.ids.join(" "),
+            declaration.source
+        );
+    }
+    match resolution.winner() {
+        None => println!("  {}", resolution.rule),
+        Some(winner) => println!("  winner: {} - {}", winner.ids.join(" "), resolution.rule),
+    }
+    let claimants = resolution.claimants();
+    if claimants.len() > 1 {
+        println!(
+            "  declared by more than one application: {}",
+            claimants.join(", ")
+        );
+    }
+}
+
 fn handle_test() -> i32 {
+    let resolution = scheme_ownership();
     let status = Status {
         registered: match platform::imp::is_registered() {
             Ok(registered) => registered,
@@ -548,26 +1080,82 @@ fn handle_test() -> i32 {
                 return 1;
             }
         },
-        handler: platform::imp::current_handler().unwrap_or(None),
         caveat: if cfg!(target_os = "macos") {
-            Some("the default handler cannot be read without LSCopyDefaultHandlerForURLScheme, \
-                  which this fork does not bind; check System Settings > General > Login Items & Extensions"
-                .to_string())
+            Some(
+                "the default handler cannot be read on macOS; check System Settings > General \
+                  > Login Items & Extensions"
+                    .to_string(),
+            )
         } else {
             None
         },
     };
 
     println!("registered: {}", status.registered);
-    match &status.handler {
-        Some(handler) => println!("nxm:// handler: {handler}"),
-        None => println!("nxm:// handler: (none - the OS will ask you which app to use)"),
-    }
+    println!("nxm:// handler: {}", handler_name(&resolution));
+    // The line that was missing. `registered: true` above means "nxmproxy is one
+    // of the applications this desktop may offer for nxm://", which is what
+    // `install` publishes and is true the moment it runs. It says nothing about
+    // whether nxmproxy is the one that gets the link, and printing it alone is
+    // how a bypassed install reads as a working one.
+    println!(
+        "nxmproxy handles nxm://: {}",
+        if resolution.owns() { "yes" } else { "no" }
+    );
+    print_resolution(&resolution);
     if let Some(caveat) = &status.caveat {
         println!("note: {caveat}");
     }
-    // Upstream's contract, kept: a non-zero code means "not installed".
-    i32::from(!status.registered)
+    // Everything above is the OS's answer, and the OS is not what decides a link
+    // clicked in a browser. One line per browser that has decided it for
+    // itself, and nothing else: the file to open, and the setting inside it.
+    // `README` has the rest, and the edit is the user's - no program may write
+    // another application's configuration.
+    let overriding = browser_overrides();
+    for over in &overriding {
+        println!(
+            "browser override: {} decides nxm:// for itself: {} ({})",
+            over.browser,
+            over.says,
+            over.source.display()
+        );
+    }
+    // Upstream's contract, kept: a non-zero code means "not working". It is no
+    // longer the same thing as "not installed", because those are now separable
+    // facts:
+    //
+    //   1  nxmproxy is not even published as a handler
+    //   3  it is published, and something other than nxmproxy still gets the link
+    //
+    // 3 is `EXIT_NEEDS_USER` for the same reason `install` returns it: nothing
+    // failed, the platform allows nothing further, and the remaining step is a
+    // click in settings. A caller that only cares whether nxm:// works has a
+    // single answer now, and a caller that distinguishes the two cases still
+    // can.
+    //
+    // A browser override is 3 and not 0 because exiting 0 over it is the false
+    // green this command exists to end, one level further up than the OS: the
+    // OS would open nxmproxy, and the browser would not.
+    if !status.registered {
+        platform::EXIT_FAILED
+    } else if resolution.owns() && overriding.is_empty() {
+        platform::EXIT_OK
+    } else {
+        platform::EXIT_NEEDS_USER
+    }
+}
+
+/// The browsers on this machine that answer for `nxm://` without the OS.
+///
+/// One home, one read. Not logged and not in `list --json`: this is a
+/// diagnostic for a person staring at a link that arrived nowhere, and a GUI
+/// gets the same answer from the line `test` prints rather than a second field
+/// that could disagree with it.
+fn browser_overrides() -> Vec<browser::Override> {
+    std::env::var_os("HOME")
+        .map(std::path::PathBuf::from)
+        .map(|home| browser::overrides(&home))
+        .unwrap_or_default()
 }
 
 /// Compose `install`: publish nxmproxy, claim `nxm://`, and make sure a link
@@ -601,34 +1189,31 @@ fn handle_install(config: &mut Config, save: &dyn Fn(&Config) -> i32) -> i32 {
     if already_configured {
         println!("Keeping the mod managers already in your configuration.");
     } else {
-        match detect_manager() {
-            Some((known, manager)) => match config.register_manager(known.id, manager) {
-                Ok(()) => {
-                    routing_ready = true;
-                    let saved = save(config);
-                    if saved != platform::EXIT_OK {
-                        code = saved;
+        match sole_candidate(&detect_candidates()) {
+            Some(candidate) => {
+                match config.register_manager(&candidate.id, candidate.manager.clone()) {
+                    Ok(()) => {
+                        routing_ready = true;
+                        let saved = save(config);
+                        if saved != platform::EXIT_OK {
+                            code = saved;
+                        }
+                        println!(
+                            "registered {} as {}; every game routes to it.",
+                            candidate.name, candidate.id
+                        );
                     }
-                    println!(
-                        "Found {} on this machine and registered it as {}. Every game routes to \
-                         it until you `assign` something else.",
-                        known.name, known.id
-                    );
+                    Err(message) => {
+                        // Not fatal, and not a claim failure either: the scheme is
+                        // claimed and the user can type the command by hand.
+                        eprintln!(
+                            "nxmproxy: could not pre-register {}: {message}",
+                            candidate.name
+                        );
+                    }
                 }
-                Err(message) => {
-                    // Not fatal, and not a claim failure either: the scheme is
-                    // claimed and the user can type the command by hand.
-                    eprintln!("nxmproxy: could not pre-register {}: {message}", known.name);
-                }
-            },
-            None => {
-                println!(
-                    "\nnxmproxy handles nxm://, but there is no mod manager to forward to, so a\n\
-                     link would arrive and go nowhere. Add one now:\n\n    \
-                     nxmproxy register gamemodmanager gamemodmanager -- --handle-nxm %1\n\n\
-                     `nxmproxy list --json` lists the managers it can find on this machine."
-                );
             }
+            None => print_candidates(&detect_candidates()),
         }
     }
 
@@ -640,14 +1225,73 @@ fn handle_install(config: &mut Config, save: &dyn Fn(&Config) -> i32) -> i32 {
         code = platform::EXIT_NEEDS_USER;
     }
 
-    if claim.claimed {
+    // **Verify, do not believe.** Everything above worked from the [`Claim`] it
+    // was handed, which is a statement about what we asked for. The only fact a
+    // user cares about is what the machine now says, so it is read back here -
+    // by the same function `test` and `list` use, and logged, so a claim that
+    // did not take can be read later instead of guessed at.
+    let resolution = scheme_ownership();
+    if resolution.owns() {
         println!("nxm:// links now open in nxmproxy.");
-    } else {
-        println!("nxmproxy is registered as an nxm:// handler.");
-        println!("One step is left for you to do:");
-        println!("{}", claim.instruction);
+        return code;
     }
-    code
+    for line in claim_refusal(&resolution, &claim.instruction) {
+        println!("{line}");
+    }
+    // Nothing failed here; the platform allowed nothing further and one click
+    // remains. Never 0 over a scheme nxmproxy does not hold.
+    if code == platform::EXIT_OK {
+        platform::EXIT_NEEDS_USER
+    } else {
+        code
+    }
+}
+
+/// What `install` says after asking for the scheme and reading back, given that
+/// it did not get it. Never called when it did.
+///
+/// Pure, and extracted from the middle of [`handle_install`] for a reason that
+/// is not tidiness: the decision "is this a verified claim or a request that
+/// did not take" is the one this command exists to get right, and inline in a
+/// thirty-line function it had no reachable control. A mutation that swapped the
+/// read for the [`Claim`] it was handed went **green** on the end-to-end test,
+/// because on Linux `claim()` happens to verify by the very same read - so the
+/// two paths were indistinguishable there and the branch was untested. Here they
+/// are distinguishable, and a caller that has just read the machine cannot
+/// accidentally believe something else.
+///
+/// `instruction` is what the platform said to do about it, and is never empty
+/// when the platform could not take the claim.
+fn claim_refusal(resolution: &platform::Resolution, instruction: &str) -> Vec<String> {
+    let mut lines = vec!["nxmproxy is registered as an nxm:// handler.".to_string()];
+    match resolution.winner() {
+        // Someone else still gets the link. Say who **and from where**: a bare
+        // application name is exactly what the user could not act on last time.
+        Some(winner) => lines.push(format!(
+            "nxm:// still opens with {}, from [{}] of {}",
+            winner.ids.join(" "),
+            winner.section,
+            winner.source
+        )),
+        // The chain was read and says nobody claims it. That is a fact.
+        None if resolution.readable => {
+            lines.push("nxm:// has no default handler; the desktop will ask.".to_string())
+        }
+        // The platform cannot answer at all. Saying "nothing claims nxm://" here
+        // would be a confident sentence about something nobody looked at.
+        None => lines.push(
+            "nxm:// still opens with nxmproxy. nxmproxy cannot read \
+                            the answer back here, so it will not claim it either."
+                .to_string(),
+        ),
+    }
+    lines.push("One step is left for you to do:".to_string());
+    lines.push(if instruction.is_empty() {
+        "Set nxm:// in your desktop's default applications settings.".to_string()
+    } else {
+        instruction.to_string()
+    });
+    lines
 }
 
 /// Compose `uninstall`: give the scheme back, then remove what we published.
@@ -719,7 +1363,24 @@ fn run() -> i32 {
         }
     };
 
-    match cli.command {
+    // Two spellings, one command: `nxmproxy <url>` and `nxmproxy url <url>`.
+    //
+    // Folding them together here, once, is why the rest of this function still
+    // matches on `Command` alone. `args_conflicts_with_subcommands` means clap
+    // refuses a link *and* a command on one line, so the two remaining states
+    // are the two real ones plus "neither", which is an empty command line.
+    let command = match (cli.url, cli.command) {
+        (Some(url), None) => Command::Url { url },
+        (None, Some(command)) => command,
+        _ => Cli::command()
+            .error(
+                clap::error::ErrorKind::DisplayHelpOnMissingArgumentOrSubcommand,
+                "an nxm:// link, or a command",
+            )
+            .exit(),
+    };
+
+    match command {
         Command::Url { url } => handle_url(&config, &url),
 
         Command::Install => handle_install(&mut config, &save),
@@ -727,6 +1388,8 @@ fn run() -> i32 {
         Command::Uninstall => handle_uninstall(),
 
         Command::Test => handle_test(),
+
+        Command::Discover => handle_discover(&mut config, &save),
 
         Command::List { json } => {
             if json {
@@ -758,7 +1421,7 @@ fn run() -> i32 {
                 if !config.managers[&name].takes_url() {
                     eprintln!(
                         "warning: {name:?} has no %1, %u or %U in its arguments, so it will be \
-                         started but given no link. Re-run with the link code in the right position."
+                         started but given no link."
                     );
                 }
                 if resolve_exec(&config.managers[&name].exec).is_none() {

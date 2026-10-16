@@ -58,7 +58,9 @@ pub const KNOWN: &[Known] = &[
         name: "Vortex Mod Manager",
         exec: r"C:\Program Files (x86)\Black Tree Gaming\Vortex\Vortex.exe",
         args: &["%1"],
-        note: "Windows default install path. Also exposes a named pipe: vortex_download.",
+        note: "Windows default install path. Upstream's README names `vortex_download` \
+               as its pipe - that is an EXAMPLE address, not a verified fact about \
+               Vortex, and nothing here has found evidence that Vortex binds it.",
         desktop: None,
     },
     Known {
@@ -91,8 +93,10 @@ pub const KNOWN: &[Known] = &[
         name: "Arsenal",
         exec: "arsenal",
         args: &["%1"],
-        note: "Helldivers 2. UNVERIFIED: no public source, so the executable name is a guess. \
-               Set the real path yourself.",
+        note: "Helldivers 2. The name `arsenal` here is still a guess, and is expected to miss: \
+               the real entry is `hd2arsenal.desktop` and the real command takes `--no-sandbox %U`. \
+               It is found properly by `xdg::declared`, which reads the x-scheme-handler/nxm \
+               declaration that entry publishes - so this row exists only to name it in `list`.",
         desktop: None,
     },
 ];

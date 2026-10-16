@@ -48,6 +48,11 @@ use crate::platform::Claim;
 /// manager's registration.
 pub const PROG_ID: &str = "GameModManager.NxmProxy";
 const SCHEME: &str = "nxm";
+
+/// The id this platform registers nxmproxy under, which is what the shell's
+/// scheme association names when nxmproxy is the handler. See
+/// [`crate::platform::Status`] for why `test` needs to compare it.
+pub const OWN_ID: &str = PROG_ID;
 const CLASSES: &str = r"HKCU\Software\Classes";
 const REGISTERED_APPLICATIONS: &str =
     r"HKCU\Software\Microsoft\Windows\CurrentVersion\RegisteredApplications";
@@ -75,6 +80,46 @@ pub enum RegOp {
 /// The command line the shell runs to hand us one link.
 pub fn handler_command_line(exe: &Path) -> String {
     format!("\"{}\" url \"%1\"", exe.to_string_lossy())
+}
+
+/// The registry key whose value is the effective handler for the scheme.
+///
+/// A [`Declaration::source`] here, so the chain `test` prints names a place the
+/// user can open in `regedit` rather than a filename that is not one.
+pub fn handler_key() -> String {
+    format!(r"{CLASSES}\{SCHEME}\shell\open\command")
+}
+
+/// The program part of a handler command line, i.e. its first token.
+///
+/// Windows stores the whole command under the bare scheme key, so "is this
+/// ours" is a comparison of paths and not the desktop-id comparison the other
+/// two platforms do. Pure, and the reason [`owns`] can say which of the two it
+/// is doing.
+pub fn program_of(command: &str) -> &str {
+    let trimmed = command.trim();
+    match trimmed.strip_prefix('"') {
+        Some(rest) => rest.split('"').next().unwrap_or(rest),
+        None => trimmed.split_whitespace().next().unwrap_or(trimmed),
+    }
+}
+
+/// Whether the effective handler is this very program.
+///
+/// Compared against [`std::env::current_exe`] rather than against
+/// [`OWN_ID`], because the value under the bare `nxm` key is a command line and
+/// a ProgID is not in it. The two can differ in any case: `install` publishes the
+/// ProgID, and the shell only runs the command once the user has chosen a
+/// default app, which no program may choose for them.
+pub fn owns(resolution: &crate::platform::Resolution) -> bool {
+    let Some(command) = resolution.first_id() else {
+        return false;
+    };
+    let Ok(ours) = std::env::current_exe() else {
+        return false;
+    };
+    let same = |path: &Path| std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+    same(Path::new(program_of(command))) == same(&ours)
 }
 
 /// Everything `install` does, as data.
@@ -330,7 +375,7 @@ pub fn unclaim() -> Result<Claim, String> {
 /// ever wrong to write there, and we never do.
 pub fn current_handler() -> Result<Option<String>, String> {
     let output = Command::new("reg")
-        .args(["query", r"HKCR\nxm\shell\open\command", "/ve"])
+        .args(["query", &handler_key(), "/ve"])
         .output()
         .map_err(|e| format!("could not run reg.exe ({e}); is this Windows?"))?;
     if !output.status.success() {
@@ -344,6 +389,38 @@ pub fn current_handler() -> Result<Option<String>, String> {
         .skip(1)
         .find_map(|l| l.split_once("REG_SZ"))
         .map(|(_, v)| v.trim().to_string()))
+}
+
+/// Read the machine's answer: every place Windows was told, and who won.
+///
+/// Windows keeps exactly one place - the bare `nxm` key - so this is a chain of
+/// at most one. It is still a [`Resolution`] rather than a bare name, because
+/// the question a user is asking is "where does this answer come from", and
+/// here the answer is a registry key they can open.
+pub fn resolve() -> crate::platform::Resolution {
+    let command = current_handler().unwrap_or(None);
+    let declarations: Vec<crate::platform::Declaration> = command
+        .map(|command| {
+            vec![crate::platform::Declaration {
+                source: handler_key(),
+                section: "scheme handler".to_string(),
+                // One element: a command line is one handler, not a ranked list.
+                ids: vec![command],
+            }]
+        })
+        .unwrap_or_default();
+    let rule = if declarations.is_empty() {
+        "no application is registered for nxm://".to_string()
+    } else {
+        format!("the {} key is the effective handler", handler_key())
+    };
+    crate::platform::Resolution {
+        declarations,
+        rule,
+        // `reg.exe` answered; an empty list means nothing is registered under
+        // the scheme key, which is a state and not an absence of knowledge.
+        readable: true,
+    }
 }
 
 /// The key whose presence means "nxmproxy is registered".

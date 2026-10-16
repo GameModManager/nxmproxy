@@ -26,21 +26,33 @@ pub enum Reason {
     /// More than one manager and no assignment for this domain. Guessing here
     /// is a misroute, so we do not.
     Ambiguous(Vec<String>),
+    /// Every manager we know of was found by discovery, and the user has not
+    /// assigned one. Guessing here is the same misroute as above, wearing a
+    /// friendlier hat.
+    Unassigned(Vec<String>),
 }
 
 impl Reason {
-    /// A message that tells the user what to type next.
+    /// The fact, plus the one command that changes it.
+    ///
+    /// One remedy line, not three: the `_` catch-all and the "what should
+    /// happen instead" commentary are in `assign --help`, and a user reading
+    /// this has a browser waiting on them.
     pub fn message(&self, domain: &str) -> String {
         match self {
             Reason::NoManagers => format!(
-                "no mod managers are registered, so there is nothing to forward the nxm link for \
-                 {domain:?} to.\n  register one:  nxmproxy register <name> <exec> [<args>...]"
+                "no mod manager is registered, so nothing can forward {domain:?}.\n  \
+                 nxmproxy register <name> <exec> [<args>...]"
             ),
             Reason::Ambiguous(ids) => format!(
-                "no mod manager is assigned to the nxm domain {domain:?}, and {} managers are \
-                 registered ({}) so guessing would deliver the link to the wrong one.\n  assign one:  \
-                 nxmproxy assign <name> {domain}\n  or send every unassigned game to one of them:  \
-                 nxmproxy assign <name> _",
+                "{domain:?} is assigned to none of the {} registered mod managers ({}).\n  \
+                 nxmproxy assign <name> {domain}",
+                ids.len(),
+                ids.join(", ")
+            ),
+            Reason::Unassigned(ids) => format!(
+                "the {} known mod manager(s) ({}) were all found by discovery and none is chosen, \
+                 so {domain:?} is not forwarded.\n  nxmproxy assign <name> {domain}",
                 ids.len(),
                 ids.join(", ")
             ),
@@ -63,11 +75,15 @@ pub enum Route {
 }
 
 impl Route {
-    /// The domain this route was made for, either way.
-    pub fn domain(&self) -> &str {
+    /// The manager this link goes to, if any.
+    ///
+    /// So the log can name the manager next to the argv it was given, instead
+    /// of the argv alone: "the link went somewhere" and "the link went to the
+    /// thing you registered" are different claims.
+    pub fn manager_id(&self) -> Option<&str> {
         match self {
-            Route::Manager { domain, .. } => domain,
-            Route::Unhandled { domain, .. } => domain,
+            Route::Manager { manager_id, .. } => Some(manager_id),
+            Route::Unhandled { .. } => None,
         }
     }
 
@@ -84,13 +100,20 @@ impl Route {
 ///
 /// 1. an exact assignment for the domain;
 /// 2. the `_` catch-all;
-/// 3. **the only registered manager**, if there is exactly one.
+/// 3. **the only manager the user actually chose**, if there is exactly one.
 ///
 /// Step 3 is why an empty configuration works out of the box: a user with one
 /// mod manager and no config at all still gets their links, which is what
 /// upstream could not do. It deliberately does not fire when two managers are
 /// registered, because with two there is no single obvious owner and a wrong
 /// guess is a link in someone else's mod queue.
+///
+/// **Step 3 counts only managers the user chose.** One that discovery merely
+/// found is not a choice, and letting it win by default would be the exact
+/// failure the rest of this function exists to prevent - discovered by the back
+/// door, through a shortcut that reads as "nothing is configured, so anything
+/// goes". An assignment to a discovered manager does route it; that is a user
+/// typing `assign`, and it is the whole point of remembering the manager.
 pub fn resolve(config: &Config, domain: &str) -> Route {
     let domain = domain.trim().to_ascii_lowercase();
 
@@ -100,12 +123,18 @@ pub fn resolve(config: &Config, domain: &str) -> Route {
         .or_else(|| config.games.get(CATCH_ALL))
         .and_then(|id| config.managers.get(id).map(|manager| (id, manager)));
 
+    let chosen: Vec<(&String, &Manager)> = config
+        .managers
+        .iter()
+        .filter(|(id, _)| !config.discovered.contains(*id))
+        .collect();
+
     let (manager_id, manager) = match by_assignment {
         Some(found) => found,
-        None if config.managers.len() == 1 => {
-            // Safe: exactly one manager, so there is nothing to choose between.
-            let (id, manager) = config.managers.iter().next().unwrap();
-            (id, manager)
+        None if chosen.len() == 1 => {
+            // Safe: exactly one manager the user chose, so there is nothing to
+            // choose between.
+            chosen[0]
         }
         None if config.managers.is_empty() => {
             return Route::Unhandled {
@@ -113,10 +142,16 @@ pub fn resolve(config: &Config, domain: &str) -> Route {
                 reason: Reason::NoManagers,
             }
         }
+        None if chosen.is_empty() => {
+            return Route::Unhandled {
+                domain,
+                reason: Reason::Unassigned(config.managers.keys().cloned().collect()),
+            }
+        }
         None => {
             return Route::Unhandled {
                 domain,
-                reason: Reason::Ambiguous(config.managers.keys().cloned().collect()),
+                reason: Reason::Ambiguous(chosen.into_iter().map(|(id, _)| id.clone()).collect()),
             }
         }
     };
@@ -166,8 +201,14 @@ pub fn spawn_args(manager: &Manager, url: &str) -> (String, Vec<String>) {
 
 /// Deliver the link.
 ///
-/// Tries the manager's named pipe first if it has one (a running manager
-/// handles it faster than a cold start), then falls back to spawning.
+/// Tries the manager's listening address first if it has one (a running
+/// manager handles it faster than a cold start), then falls back to spawning.
+///
+/// The fallback is unconditional and is what makes the attempt safe to make on
+/// every single link: the OS runs us once per link, so a failed delivery has
+/// to be both cheap and ordinary, and it has to happen. Every failure of the
+/// fast path is an error rather than a block, which is the property a FIFO
+/// cannot offer - see [`crate::pipe`].
 ///
 /// The child is spawned with all three standard streams nulled and is **never
 /// waited on**: the OS launched us for one uri, and we return as soon as it
@@ -183,28 +224,52 @@ pub fn deliver(route: &Route, url: &str) -> Result<(), String> {
     };
 
     if let Some(pipe_name) = manager.pipe.as_deref() {
-        logger::info(format!("trying pipe {pipe_name} for manager {manager_id}"));
+        logger::info(format!(
+            "pipe manager={manager_id:?} pipe={pipe_name:?} result=trying"
+        ));
         if pipe::try_write_pipe(pipe_name, url) {
-            logger::info(format!("delivered over pipe {pipe_name}"));
+            logger::info(format!(
+                "pipe manager={manager_id:?} pipe={pipe_name:?} result=delivered"
+            ));
             return Ok(());
         }
         // Not necessarily a problem: the manager is probably not running yet.
         logger::info(format!(
-            "pipe {pipe_name} write failed, falling back to spawning"
+            "pipe manager={manager_id:?} pipe={pipe_name:?} result=unavailable action=spawning"
         ));
     }
 
     let (exec, args) = spawn_args(manager, url);
-    logger::info(format!("spawning manager {manager_id}: {exec} {args:?}"));
 
-    Command::new(&exec)
+    // THE dispatch record. Manager, exact argv, and whether the process
+    // actually started - or the OS's own words on why it did not.
+    //
+    // The failure this exists for is silent: a link reaches nxmproxy, the
+    // manager is missing or not executable, `spawn` returns an error, we exit
+    // 1 into a terminal nobody is watching, and the user sees a browser click
+    // that did nothing. Everything else about a working link is invisible too.
+    // `argv` is Rust's debug form so it stays on one line and a url containing
+    // a space or a quote cannot break the record into two.
+    let record = format!("spawn manager={manager_id:?} exec={exec:?} argv={args:?}");
+    match Command::new(&exec)
         .args(&args)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .spawn()
-        .map(|_| ()) // deliberately dropped: we do not wait, and must not.
-        .map_err(|e| format!("could not start mod manager {manager_id:?} ({exec}): {e}"))
+    {
+        Ok(_) => {
+            logger::info(format!("{record} result=started"));
+            Ok(())
+        }
+        Err(e) => {
+            logger::error(format!("{record} result=failed err={e:?}"));
+            // Deliberately dropped on success: we do not wait, and must not.
+            Err(format!(
+                "could not start mod manager {manager_id:?} ({exec}): {e}"
+            ))
+        }
+    }
 }
 
 #[cfg(test)]
@@ -224,6 +289,15 @@ mod tests {
         c.register_manager("vortex", mgr("/usr/bin/vortex", &["%1"]))
             .unwrap();
         c
+    }
+
+    /// The message an unrouted domain would actually print, so the assertion is
+    /// on what the user sees rather than on the enum alone.
+    fn ids_message(config: &Config, domain: &str) -> String {
+        match resolve(config, domain) {
+            Route::Unhandled { reason, .. } => reason.message(domain),
+            Route::Manager { .. } => String::new(),
+        }
     }
 
     #[test]
@@ -305,6 +379,115 @@ mod tests {
         }
         let message = Reason::NoManagers.message("skyrimse");
         assert!(message.contains("register"), "{message}");
+    }
+
+    /// The whole point of remembering a discovered manager: knowing one exists
+    /// is not choosing one.
+    ///
+    /// Rule 3 says one registered manager owns every unassigned domain, and a
+    /// discovered manager **is** registered. Without the `discovered` exclusion
+    /// this file would auto-route every link on the machine into an application
+    /// the user never picked, through the one rule that was written to be safe
+    /// when a user had exactly one manager and nothing to choose from.
+    #[test]
+    fn a_discovered_manager_never_owns_a_game_until_it_is_assigned() {
+        let mut config = Config::default();
+        assert!(
+            config
+                .discover_manager("hd2arsenal", mgr("/usr/bin/hd2arsenal", &["%1"]))
+                .unwrap(),
+            "precondition: it was remembered"
+        );
+
+        match resolve(&config, "helldivers2") {
+            Route::Unhandled {
+                reason: Reason::Unassigned(ids),
+                ..
+            } => {
+                assert_eq!(ids, vec!["hd2arsenal".to_string()]);
+                let message = ids_message(&config, "helldivers2");
+                assert!(message.contains("assign"), "{message}");
+                assert!(
+                    message.contains("found by discovery"),
+                    "the message must say why it refuses: {message}"
+                );
+            }
+            other => panic!("discovery auto-assigned a game: {other:?}"),
+        }
+
+        // Assign it and it routes, which is what makes remembering one useful:
+        // the user picks, and then it is live.
+        config.assign("hd2arsenal", "helldivers2").unwrap();
+        assert!(resolve(&config, "helldivers2").is_handled());
+    }
+
+    /// A discovered manager is also invisible to the ambiguity count, in both
+    /// directions: it cannot turn a working one-manager install into a refusal,
+    /// and it cannot join the list of choices a user is asked to pick between.
+    ///
+    /// **Two configurations, not one, because they reach different lines.**
+    /// With a single manager the user chose, `resolve` returns from the
+    /// `chosen.len() == 1` arm and never builds an `Ambiguous` list at all - so
+    /// a test written only in that shape proves nothing about that list. The
+    /// first assertion was written that way and its mutation control came back
+    /// **green**: the line it was meant to defend does not execute. The second
+    /// configuration is the one that reaches the list.
+    #[test]
+    fn a_discovered_manager_is_never_one_of_the_choices_offered() {
+        // One the user chose, one merely found: the chosen one still routes.
+        let mut config = with_one_manager();
+        config
+            .discover_manager("hd2arsenal", mgr("/usr/bin/hd2arsenal", &["%1"]))
+            .unwrap();
+        match resolve(&config, "skyrimse") {
+            Route::Manager { manager_id, .. } => assert_eq!(manager_id, "vortex"),
+            other => panic!("the one manager the user chose must still route: {other:?}"),
+        }
+
+        // Two the user chose, one merely found: genuinely ambiguous, and the
+        // refusal must name only the two the user registered. Naming
+        // `hd2arsenal` there would ask the user to choose between applications
+        // they never picked, which is the question discovery exists to avoid
+        // asking rather than to ask badly.
+        let mut two = Config::default();
+        two.register_manager("vortex", mgr("/usr/bin/vortex", &["%1"]))
+            .unwrap();
+        two.register_manager("mo2", mgr("/usr/bin/mo2", &["%1"]))
+            .unwrap();
+        two.discover_manager("hd2arsenal", mgr("/usr/bin/hd2arsenal", &["%1"]))
+            .unwrap();
+
+        match resolve(&two, "skyrimse") {
+            Route::Unhandled {
+                reason: Reason::Ambiguous(ids),
+                ..
+            } => assert_eq!(
+                ids,
+                vec!["mo2".to_string(), "vortex".to_string()],
+                "the refusal offered a manager the user never chose"
+            ),
+            other => panic!("two chosen managers must still be ambiguous: {other:?}"),
+        }
+    }
+
+    /// Unregistering forgets both halves. A stale id left in `discovered` would
+    /// silently downgrade a manager the user re-registers by hand into one that
+    /// routes nothing.
+    #[test]
+    fn a_removed_manager_is_no_longer_remembered_as_discovered() {
+        let mut config = Config::default();
+        config
+            .discover_manager("hd2arsenal", mgr("/usr/bin/hd2arsenal", &["%1"]))
+            .unwrap();
+        assert!(config.unregister_manager("hd2arsenal").unwrap());
+        assert!(config.discovered.is_empty(), "{:?}", config.discovered);
+        config
+            .register_manager("hd2arsenal", mgr("/usr/bin/hd2arsenal", &["%1"]))
+            .unwrap();
+        match resolve(&config, "helldivers2") {
+            Route::Manager { manager_id, .. } => assert_eq!(manager_id, "hd2arsenal"),
+            other => panic!("a hand-registered manager must route: {other:?}"),
+        }
     }
 
     #[test]
