@@ -24,7 +24,8 @@ removed.
   is ambiguous, and `resolve` refuses rather than guessing. Safe to re-run - an
   id that is already known is left exactly as it is, and nothing is ever removed.
 * `list` reports which managers were found and which were chosen. `list --json`
-  is version 3 and carries `managers[].discovered`.
+  is version 5 and carries `managers[].discovered`, `scheme.declarations`,
+  `handler` and `owns_scheme`.
 * **`test` reports a browser that decides `nxm://` for itself.** A Gecko profile
   keeps its own per-scheme table and consults it *before* the OS, so once `nxm`
   has an entry there no change to any `mimeapps.list` ever reaches that profile
