@@ -94,6 +94,32 @@ mod manager's entry.** Claiming is for nxmproxy. Nothing here edits another
 manager's `[Added Associations]`, its entry for any other scheme, or its
 registration on any platform.
 
+### Changed: the Linux claim writes every row it owns, not the one `xdg-mime` writes
+
+| Was | Now | Why |
+| --- | --- | --- |
+| `xdg-mime default nxmproxy.desktop x-scheme-handler/nxm`, which writes **one** file - `$XDG_CONFIG_HOME/mimeapps.list` - and **replaces** that file's value for the key | A text edit that **prepends** `nxmproxy.desktop` into the `[Default Applications]` value of **ten** files: `$XDG_CONFIG_HOME/$desktop-mimeapps.list` and `$XDG_CONFIG_HOME/mimeapps.list` for every `$desktop` it can find, plus the same two rows under `$XDG_DATA_HOME/applications`. Each write is read back | `$XDG_CONFIG_HOME/$desktop-mimeapps.list` sits **above** `$XDG_CONFIG_HOME/mimeapps.list`. GameMod Manager writes the upper one, so on a KDE session the single file `xdg-mime` touches is worth nothing and the desktop opened GMM every time, on every install. |
+| Reading back the file it had just written | Reading back the **whole chain** in the specification's order, through the same rule `test` uses, and applying the specification's second step: an id whose `.desktop` file is missing or does not declare the type is skipped, and the search carries on | Reading one's own file back is how `test` once printed `nxmproxy handles nxm://: yes` and exited 0 over a scheme GMM held. |
+| One line in the output | A count, and a named line for every location that **refused** the write | `xdg-mime` exits 0 and writes nothing when the target directory is missing, so exit status is not evidence. A location that could not be claimed is named, or it is silently skipped. |
+| Nothing on `uninstall` beyond deleting the desktop entry | The inverse edit, in every file `install` wrote. Prepending is invertible, so the previous bytes come back exactly; a file that held nothing but nxmproxy's own line is removed rather than left with an empty group | `xdg-mime default` replaces rather than appends, so nothing recorded what was there before and `uninstall` could not put the user's previous handler back. |
+
+**The rows deliberately not written: `$XDG_CONFIG_DIRS` and `$XDG_DATA_DIRS`.**
+They are read, never written. They sit *below* `$XDG_CONFIG_HOME`, the
+specification stops at the first file that names a valid handler, and both
+`$XDG_CONFIG_HOME` rows are written - so no entry below can outrank what was
+just written. Writing them would buy nothing and cost three things that are not
+nothing: root-owned directories an ordinary user cannot write, a
+`~/.local/share/flatpak/exports/share` directory that *is* writable and is
+flatpak's, and - the moment anyone runs `sudo nxmproxy install` - a silent
+reassignment of the scheme for every user on the machine.
+
+**Where a claim genuinely cannot be defended, and is not defended.** Another
+application that writes the *same* row afterwards wins; there is no precedence
+left to appeal to and no program may write another program's entry out of it.
+What holds is that `test` then reports the loss, names the file it was written
+to, and exits 3. A rival writing a *lower* row does lose, and that is the case
+the ten rows buy.
+
 The other half of that change is honesty about the exit code. `install` exits 0
 only when nxmproxy really is the handler *and that was verified from this
 process*. On macOS and on Windows it cannot be, so it exits **3** and prints the
@@ -122,7 +148,7 @@ which exist in no file the user has to go and read.
 
 | Platform | Can it claim? | How | What `install` reports |
 | --- | --- | --- | --- |
-| Linux | **Yes** | `xdg-mime default nxmproxy.desktop x-scheme-handler/nxm`, then read the file back | exit 0 once the file confirms it |
+| Linux | **Yes** | Ten `mimeapps.list` files under `$XDG_CONFIG_HOME` and `$XDG_DATA_HOME/applications`, each `[Default Applications]` value prepended rather than replaced, then the whole chain read back | exit 0 once the chain, resolved the way the desktop resolves it, says nxmproxy |
 | macOS | **Yes, but the OS asks** | `LSSetDefaultHandlerForURLScheme`; macOS 12+ prompts | exit 3, always. The call is one-way and cannot be read back |
 | Windows | **No** | It opens `ms-settings:defaultapps` and stops | exit 3, always |
 
@@ -135,12 +161,17 @@ nothing here tries. What Windows *does* permit is a correct ProgID plus a
 `RegisteredApplications` entry, which is what makes the application appear in
 Default Apps - and then the user finishes in one click.
 
-**Why GMM's Linux pattern is not copied.** GameMod Manager's own registration
-calls `xdg-mime default` *and* `set_mimeapps_defaults`, which forces the same
-default into three files (`kde-mimeapps.list`, `mimeapps.list`, and the
-data-level `mimeapps.list`). That is how a user with two mod managers ends up
-with one of them buried, un-reversible without hand editing. nxmproxy writes one
-line, in one file, and takes it back out.
+**What is copied from GMM, and what is not.** GameMod Manager's Linux
+registration calls `xdg-mime default` *and* `set_mimeapps_defaults`, which forces
+the same default into three files: `kde-mimeapps.list`, `mimeapps.list`, and the
+data-level `mimeapps.list`. That propagation is the mechanism that works, and
+this fork writes the same three plus the `$desktop-mimeapps` rows GMM misses -
+see the divergence table above. What is **not** copied is the edit itself: GMM's
+`set_mimeapps_scheme` calls `set_entry`, which **replaces** the value for the
+key, so a second mod manager's choice is deleted from those files with nothing
+recording what it was, and `unregister` resets to Nautilus rather than to
+whatever the user had. nxmproxy **prepends** instead, so every other id keeps
+its place in the ranked list and comes back byte for byte on `uninstall`.
 
 ---
 
@@ -170,44 +201,47 @@ fails independently and the exit code is the worst of them.
 
 ### Linux
 
-`install` writes exactly two files:
+`install` writes the desktop entry, then the scheme into every row it owns:
 
 ```
 ~/.local/share/applications/nxmproxy.desktop
     MimeType=x-scheme-handler/nxm;
 
+~/.config/{kde,gnome,xfce,lxqt,…}-mimeapps.list     <- every $desktop it finds
 ~/.config/mimeapps.list
+~/.local/share/applications/{kde,gnome,xfce,lxqt,…}-mimeapps.list
+~/.local/share/applications/mimeapps.list
     [Default Applications]
-    x-scheme-handler/nxm=nxmproxy.desktop
+    x-scheme-handler/nxm=nxmproxy.desktop;<every id that was already there>
 ```
 
-The first makes nxmproxy *eligible*. The second makes it what the desktop
-opens. `xdg-mime default` writes that line and only that line: no
-`kde-mimeapps.list`, no data-level `mimeapps.list`, nothing forced. That is
-asserted on content, for all three files, by a test that pre-seeds them with
-another mod manager's entries and checks every other line survives.
+The desktop entry makes nxmproxy *eligible*; the rows make it what the desktop
+opens. Both the desktop-specific rows and the plain ones are written, because
+`$desktop-mimeapps.list` outranks `mimeapps.list` and the plain one alone is
+worth nothing. Each value is **prepended**, so an existing mod manager stays in
+the list one rank down rather than being deleted. Each write is read back, and
+the claim is then verified by resolving the whole chain the way the desktop
+resolves it - not by reading nxmproxy's own file back.
 
-The exit code is not trusted. `xdg-mime default` exits 0 and **writes nothing**
-when `$XDG_CONFIG_HOME` does not exist, which it does not on a fresh account, so
-`install` creates the directory first and then reads the file back. If the file
-does not say nxmproxy, `install` says so and exits 3.
+`$XDG_CONFIG_DIRS` and `$XDG_DATA_DIRS` are **read, never written**: they cannot
+outrank `$XDG_CONFIG_HOME`, which is written in full, and writing into root's and
+flatpak's directories is not a per-user tool's business. A location that refuses
+the write is named in the output, never silently skipped.
 
-When `xdg-mime` is not installed at all, nxmproxy writes the same one line
-itself, says that it did so, and still reports the truth. That hand-written path
-has its own end-to-end test, with `xdg-mime` removed from `PATH`, because on a
-normal machine it never runs.
+`install` does not shell out to `xdg-mime` at all. `xdg-mime default` exits 0
+and **writes nothing** when `$XDG_CONFIG_HOME` does not exist, which it does not
+on a fresh account, and it **replaces** a key's value rather than prepending to
+it. The sweep is one pure text function instead: every file is created if
+missing, written, read back, and the `[Default Applications]` value re-checked.
+Nothing is reported as claimed on the strength of an exit code. There is no
+fallback path that depends on `xdg-mime` being installed, which is why the
+end-to-end test removes it from `PATH` and still passes.
 
-`uninstall` removes nxmproxy's id from that one key and leaves every other id,
-every other key, and every other group alone. If our id was the only one, the
-key is removed rather than left empty, because `key=;` is a claim on nothing,
-not the absence of a claim.
-
-> What is restored, and what is not: `xdg-mime default` **replaces** the value
-> for a key rather than appending to it, so uninstall cannot put a previous
-> default back - nothing recorded what was there. What survives is the other
-> manager's own `[Added Associations]` entry, which is how the desktop learns it
-> can still offer them. `uninstall` says this rather than implying a full
-> restore.
+`uninstall` removes nxmproxy's id from every one of those keys and leaves every
+other id, every other key, and every other group alone, in every file. A file
+that held nothing but nxmproxy's own line is removed rather than left with an
+empty `[Default Applications]` header. Because the claim is a prepend, the
+inverse is exact: a file's previous bytes come back byte for byte.
 
 ### macOS - UNVERIFIED, and it says so
 
@@ -605,7 +639,7 @@ A test asserts each of them now exits 2.
 | 0 | ok | Delivered, or the command succeeded and the result was verified. |
 | 1 | failed | Not delivered, or the command failed. **Never a panic.** |
 | 2 | usage | Bad command line (from `clap`). |
-| 3 | needs-user | **Registered, but the OS requires one step you must do by hand.** Nothing failed; nxmproxy did everything the platform allows |
+| 3 | needs-user | **Registered, but one step is left that you must do by hand.** Either the OS refused or hid the claim, or a browser decides `nxm://` for itself. Nothing failed; nxmproxy did everything the platform allows |
 
 Code 3 is what makes `install` scriptable. It is deliberately neither 1 nor 0:
 
@@ -614,8 +648,9 @@ Code 3 is what makes `install` scriptable. It is deliberately neither 1 nor 0:
 * not **0**, because on macOS and Windows nxmproxy cannot verify the claim, and
   a wrapper that reads 0 would automate an install that routes nothing.
 
-The same code also covers "no mod manager to forward to", because typing
-`nxmproxy register ...` is exactly such a step. The message always says which.
+The same code also covers "no mod manager to forward to" and "a browser overrides
+the OS", because typing `nxmproxy register ...` and editing a browser's own
+configuration are exactly such steps. The message always says which.
 
 ### Routing rules
 
@@ -866,9 +901,9 @@ red. The controls are mutation-and-observe, not assertion-counting:
 
 | # | Mutation | Test that catches it |
 | --- | --- | --- |
-| 1 | `install` force-propagates the claim into all three mimeapps files (GMM's anti-pattern) | `linux_install_claims_the_scheme_in_one_file_and_buries_nobody` |
-| 2 | the claim deletes another mod manager's lines | `the_fallback_claim_path_buries_nobody_either` |
-| 3 | `uninstall` deletes another manager's line | `linux_uninstall_removes_only_our_line` |
+| 1 | the claim writes one file, as `xdg-mime` does, and never the desktop-specific rows | `linux_install_claims_the_scheme_in_every_file_and_buries_nobody` |
+| 2 | the claim **replaces** the value instead of prepending, deleting the other managers | `linux_install_claims_the_scheme_in_every_file_and_buries_nobody`, `the_claim_needs_no_third_party_tool_and_buries_nobody` |
+| 3 | `uninstall` reverses one file and leaves nxmproxy in the rest | `linux_uninstall_restores_every_file_it_claimed` |
 | 4 | the file editor drops other lines | `setting_a_default_leaves_every_other_line_byte_for_byte` |
 | 5 | a claim that needs the user exits 0 | `only_a_verified_claim_exits_zero` |
 | 6 | `Claim::needs_user` reports a verified claim | `windows_never_reports_a_claim_it_could_not_make`, `a_claim_is_never_reported_as_verified` |
@@ -897,7 +932,12 @@ red. The controls are mutation-and-observe, not assertion-counting:
 | 29 | the `local bin:` inventory line is printed by `list` again | `list_is_exactly_the_documented_shape`, `no_command_prints_lesson_text` |
 | 30 | `test` annotates `nxm:// handler: none` with what the OS will do about it | `no_command_prints_lesson_text` |
 | 31 | `discover` ends with the assignment recipe again | `no_command_prints_lesson_text` |
-| 32 | the `* <game>` line loses its tab, so a game sits at the same indent as its manager | `list_is_exactly_the_documented_shape`, `list_shows_each_game_under_the_manager_that_owns_it` |
+| 32 | the `* <game>` line loses its tab, so a game sits at the same indent as its manager | `list_shows_each_game_under_the_manager_that_owns_it`, `list_is_exactly_the_documented_shape` |
+| 33 | `mimeapps_files` resolves one file instead of the whole chain, the original bug | `the_desktop_itself_names_nxmproxy_after_install`, `list_json_carries_the_resolution_the_terminal_prints`, `test_explains_a_scheme_two_applications_both_declare` |
+| 34 | the chain is built in the wrong order, so the plain row outranks the `$desktop` row | `the_chain_is_the_specifications_eight_rows_in_order`, `the_users_own_file_wins_over_the_system_one`, `the_desktop_itself_names_nxmproxy_after_install` |
+| 35 | a write that fails is reported as `Ok`, the `xdg-mime` silent-no-op | `a_location_that_cannot_be_claimed_is_named_with_the_reason` |
+| 36 | the on-disk discovery of a `$desktop-mimeapps.list` is disabled | `a_desktop_file_that_already_exists_is_claimed_while_another_desktop_runs` |
+| 37 | a browser override stops being reported and `test` exits 0 over it | `test_reports_a_browser_that_decides_nxm_for_itself` |
 
 Controls 29-32 are the ones that matter for the output-shape rules, and all four
 were run before this table was written. 29, 30 and 31 each came back **red on
@@ -953,6 +993,44 @@ The rest found real bugs while they were being written:
   "present" means: the JSON was satisfied by a desktop entry merely existing,
   while `install` also required the executable to resolve. Both now share one
   helper and one bar.
+
+### Two controls that came back green, and what they exposed
+
+Both are recorded here because the failure is the useful part, and because it is
+the **third** and **fourth** time in this project a control has been green on the
+first attempt - always for the same reason: a test that could not observe the
+thing it claimed to observe.
+
+**Control 33 came back green in the direction that does not hurt.** The read side
+narrowed to a single file made `test` report a **loss** while the desktop claimed
+a **win** - false negative, the direction a user can see and correct. The
+direction that costs a session is the opposite: `nxmproxy handles nxm://: yes`
+over a scheme the desktop had already given to GMM. No test compared `test`
+against `xdg-mime` at the point in `the_desktop_itself_names_nxmproxy_after_install`
+where GMM holds the *higher* row and nxmproxy the lower one - the mutation was
+simply not on that path's result. The comparison is now asserted there, and with
+the mutation reapplied the test goes red at exactly the false green:
+
+```
+nxmproxy handles nxm://: yes
+  Default Applications   nxmproxy.desktop  <- .../home/.config/mimeapps.list
+  winner: nxmproxy.desktop - the only declaration on this machine
+```
+
+**Control 36 came back green across the whole suite** - all 161 tests - with the
+discovery of a `$desktop-mimeapps.list` that already exists on disk completely
+disabled. The fixture used `kde`, and `kde` is one of the four names the
+specification's own text offers, so the row was written anyway and the discovery
+did nothing observable. `existing_desktop_lists` was dead code wearing a test.
+Rewritten around `x-cinnamon` - a name that only walking the four roots can find -
+it goes red immediately.
+
+A third control is reported here for the same reason. An early attempt at
+control 2 "replaced the prepend with a replace" came back **green** because the
+mutation removed a duplicate-collapse filter and added an equivalent
+`retain` after it: two different spellings of the same function. The control was
+not a control. Re-stated as `set_default_ids(text, key, &[id])` it turns four
+tests red with the other managers deleted from the file.
 
 ### Known coverage gap
 

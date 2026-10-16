@@ -1,5 +1,51 @@
 # Changelog
 
+## Unreleased
+
+### Changed
+
+* **`install` claims `nxm://` in every file it owns, not the one `xdg-mime`
+  writes.** `xdg-mime default` writes `$XDG_CONFIG_HOME/mimeapps.list` and
+  nothing else - and `$XDG_CONFIG_HOME/$desktop-mimeapps.list` sits **above**
+  that file, so GameMod Manager holding the upper row meant the desktop opened
+  GMM on every install, however many times nxmproxy was reinstalled. `install`
+  now writes ten files: both rows under `$XDG_CONFIG_HOME` and both under
+  `$XDG_DATA_HOME/applications`, for every `$desktop` it can find - the running
+  session, every `DesktopNames=` in an installed `xsessions/` or
+  `wayland-sessions/` entry, the stem of every `$desktop-mimeapps.list` already
+  present, and the four the specification's text names. Each write is read back.
+* **The claim prepends; it never replaces.** nxmproxy's id goes to the front of
+  the `[Default Applications]` value and every other id keeps its rank among the
+  others. GMM's own `set_mimeapps_scheme` replaces, which deletes the user's
+  previous choice with nothing recording what it was; that is not repeated here.
+* **`test` resolves the whole chain, the way a desktop does.** Both groups, every
+  file in the specification's order, and the specification's second step: an id
+  whose `.desktop` file is missing or does not declare the type is skipped and
+  the search carries on. `registered: true` can no longer print while another
+  application holds the scheme. Verified against `xdg-mime query default` on
+  identical fixtures.
+* **`uninstall` reverses every write, exactly.** Prepending is invertible, so a
+  file's previous bytes come back byte for byte - including `kde-mimeapps.list`.
+  A file that held nothing but nxmproxy's own line is removed rather than left
+  with an empty `[Default Applications]` header.
+* **A location that refused the write is named**, with its path and the reason,
+  and the header counts the loss. `xdg-mime` exits 0 and writes nothing when the
+  target directory is missing, so exit status is not evidence of anything.
+
+### Added
+
+* **`test` reports a browser that decides `nxm://` for itself.** A Gecko profile
+  keeps its own per-scheme table and consults it *before* the OS, so once `nxm`
+  has an entry there no change to any `mimeapps.list` ever reaches that profile
+  again. Read-only: it names the file and the setting inside it, and the edit is
+  the user's. Chromium has no such list - it only records that a *site* may
+  launch a *scheme* and names no application - so it is not reported.
+
+### Fixed
+
+* The output no longer prints one line per claimed file. The count says how many
+  rows were written; only the refusals get a line each.
+
 ## 0.3.0
 
 ### Added

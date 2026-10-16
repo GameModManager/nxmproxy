@@ -99,6 +99,12 @@ impl Sandbox {
         self.xdg_config_home().join("kde-mimeapps.list")
     }
 
+    /// `$HOME`, which is the tree a browser's own profile lives in.
+    #[cfg(target_os = "linux")]
+    fn home(&self) -> PathBuf {
+        self.root.join("home")
+    }
+
     /// Every file under the sandbox that is not ours, so we can prove `install`
     /// wrote no association state anywhere. Only the Linux test needs it; on
     /// the other platforms it would be dead code, which clippy rightly refuses.
@@ -171,6 +177,17 @@ impl Drop for ReadOnly {
 }
 
 fn run(sandbox: &Sandbox, args: &[&str]) -> Output {
+    run_on_desktop(sandbox, "KDE", args)
+}
+
+/// [`run`] under a named `$XDG_CURRENT_DESKTOP`.
+///
+/// Separate because the session name is the specification's `$desktop`, so the
+/// only way to ask "what does the sweep do on a machine that is not running the
+/// desktop it is claiming for" is to change it. Every test pins `KDE` by
+/// default, which is exactly what hid the discovery path.
+#[cfg(target_os = "linux")]
+fn run_on_desktop(sandbox: &Sandbox, desktop: &str, args: &[&str]) -> Output {
     Command::new(BIN)
         .args(args)
         .env("NXMPROXY_CONFIG_DIR", sandbox.config_dir())
@@ -179,6 +196,13 @@ fn run(sandbox: &Sandbox, args: &[&str]) -> Output {
         .env("XDG_DATA_HOME", sandbox.root.join("data"))
         .env("XDG_DATA_DIRS", sandbox.root.join("data").join("dirs"))
         .env("XDG_CONFIG_DIRS", sandbox.root.join("home").join("etc-xdg"))
+        // A KDE session, spelled the way a real session spells it. This is the
+        // variable the specification derives `$desktop` from, so it is what makes
+        // `~/.config/kde-mimeapps.list` a file the desktop reads rather than a
+        // file nxmproxy happens to write - and the uppercase is deliberate,
+        // because every real session capitalises its own name and the
+        // specification asks for ascii lowercase.
+        .env("XDG_CURRENT_DESKTOP", desktop)
         .env_remove("WAYLAND_DISPLAY")
         .env_remove("DISPLAY")
         .output()
@@ -210,15 +234,14 @@ fn install_sandbox(sandbox: &Sandbox) -> std::sync::MutexGuard<'static, ()> {
     guard
 }
 
-/// Like [`run`], but with `xdg-mime` unreachable.
+/// Like [`run`], but with no third-party tool on `PATH`.
 ///
-/// This exists because it is a genuinely different code path. When `xdg-mime`
-/// is on `PATH`, `install` delegates the whole edit to it and nxmproxy's own
-/// file editor never runs - so a test suite on a normal Linux machine exercises
-/// **none** of it. The fallback is what runs on a minimal or headless system,
-/// and it is the code this project wrote by hand, so it is the code that most
-/// needs proving. `xdg-mime` lives in `/usr/bin` alongside almost everything
-/// else, so PATH is emptied rather than filtered.
+/// `install` writes every `mimeapps.list` row itself now, so nothing it needs is
+/// external and this is its only path. The test still exists because "nothing on
+/// `PATH`" is a real machine - a headless container, a minimal rescue shell - and
+/// because it is the proof that the claim no longer depends on `xdg-mime`, which
+/// exits 0 while writing nothing. `xdg-mime` lives in `/usr/bin` alongside almost
+/// everything else, so PATH is emptied rather than filtered.
 #[cfg(target_os = "linux")]
 fn run_without_xdg_mime(sandbox: &Sandbox, args: &[&str]) -> Output {
     let empty = sandbox.root.join("empty-path");
@@ -231,6 +254,7 @@ fn run_without_xdg_mime(sandbox: &Sandbox, args: &[&str]) -> Output {
         .env("XDG_DATA_HOME", sandbox.root.join("data"))
         .env("XDG_DATA_DIRS", sandbox.root.join("data").join("dirs"))
         .env("XDG_CONFIG_DIRS", sandbox.root.join("home").join("etc-xdg"))
+        .env("XDG_CURRENT_DESKTOP", "KDE")
         .env("PATH", &empty)
         .output()
         .expect("could not run the nxmproxy binary")
@@ -638,19 +662,24 @@ fn a_corrupt_config_degrades_to_empty_with_a_warning() {
 // Registration. The point of the whole project: register, never seize.
 // ---------------------------------------------------------------------------
 
-/// Linux `install` claims `nxm://` in **exactly one file**, leaves every other
-/// mod manager's entry byte for byte alone, and does not repeat the claim into
-/// the two other files.
+/// Linux `install` claims `nxm://` in **every file the specification's lookup
+/// order passes through**, leaves every other mod manager's entry byte for byte
+/// alone, and can be read back the way a desktop reads it.
 ///
-/// The three files are not a guess. GameMod Manager's own Linux registration
-/// (`Core/src/platform/linux/linux_platform.cpp`, `set_mimeapps_defaults`) writes
-/// `$XDG_CONFIG_HOME/kde-mimeapps.list`, `$XDG_CONFIG_HOME/mimeapps.list`, and
-/// `$XDG_DATA_HOME/applications/mimeapps.list`. Forcing one claim into all three
-/// is how a user with two mod managers ends up with one of them buried and no
-/// way to see why. nxmproxy writes the middle one and stops.
+/// The list of locations is not a guess. The [Association between MIME types and
+/// applications specification, section
+/// 2](https://specifications.freedesktop.org/mime-apps/latest/file.html) names
+/// **eight**, in this order, and puts `$XDG_CONFIG_HOME/$desktop-mimeapps.list`
+/// **above** `$XDG_CONFIG_HOME/mimeapps.list`. GLib's `gdesktopappinfo.c` and
+/// KDE's `kmimeassociations.cpp` both walk that order. Writing only the second
+/// row is why KDE opened GameModManager on a machine where `install` had just
+/// exited 0.
+///
+/// Greed is not burial. Every other application stays listed and keeps its rank
+/// among the others; nxmproxy goes to the **front**, which is the claim.
 #[cfg(target_os = "linux")]
 #[test]
-fn linux_install_claims_the_scheme_in_one_file_and_buries_nobody() {
+fn linux_install_claims_the_scheme_in_every_file_and_buries_nobody() {
     let sandbox = Sandbox::new("install-linux");
     let _lock = install_sandbox(&sandbox);
 
@@ -661,8 +690,8 @@ fn linux_install_claims_the_scheme_in_one_file_and_buries_nobody() {
     // Vortex appears in `[Added Associations]`, which is *its own* record that
     // it handles nxm, and as the default for an unrelated scheme. It is
     // deliberately NOT seeded as the `[Default Applications]` value for nxm:
-    // taking the scheme means replacing that value, which is precisely what
-    // `xdg-mime default` does. What has to survive is everything else.
+    // taking the scheme means putting nxmproxy in front of it, which is
+    // precisely what prepending does. What has to survive is everything else.
     std::fs::create_dir_all(sandbox.xdg_config_home()).unwrap();
     std::fs::create_dir_all(sandbox.data_applications()).unwrap();
 
@@ -670,8 +699,17 @@ fn linux_install_claims_the_scheme_in_one_file_and_buries_nobody() {
                          [Default Applications]\nx-scheme-handler/http=firefox.desktop;\n";
     std::fs::write(sandbox.mimeapps(), other_manager).unwrap();
 
-    // GMM's propagation target. If we force-propagate like it does, this file
-    // gains an nxm line and the test fails on content, not on existence.
+    // **The file that actually beat us.** GameMod Manager's Linux registration
+    // writes this one, and the specification ranks it above
+    // `~/.config/mimeapps.list`, so anything it says about nxm:// wins no matter
+    // what nxmproxy writes anywhere else. The user deleted this file by hand
+    // once; it came straight back. It is seeded here with Vortex already at the
+    // front of the list, so the file nxmproxy must now claim is also the file
+    // that proves claiming it does not delete Vortex.
+    let kde_rival = "[Default Applications]\n\
+                     x-scheme-handler/nxm=vortex.desktop;hd2arsenal.desktop;\n";
+    std::fs::write(sandbox.kde_mimeapps(), kde_rival).unwrap();
+
     let data_mimeapps = "[Default Applications]\nx-scheme-handler/nxm=othermanager.desktop;\n";
     std::fs::write(
         sandbox.data_applications().join("mimeapps.list"),
@@ -699,9 +737,21 @@ fn linux_install_claims_the_scheme_in_one_file_and_buries_nobody() {
     );
     assert!(entry.contains(" url %u"), "{entry}");
 
-    // 2. The claim itself: our id is the `[Default Applications]` value for the
-    //    scheme. The lookup has to be group-aware, because the seeded file has
-    //    an `x-scheme-handler/nxm` line in `[Added Associations]` too, and a
+    // 2. THE decisive assertion, and it is the one the bug report is about.
+    //    The file that outranked every other claim now names nxmproxy first, so
+    //    the two mod managers that were ahead of it are still there - one rank
+    //    down, not deleted.
+    let claimed_kde = std::fs::read_to_string(sandbox.kde_mimeapps())
+        .unwrap_or_else(|e| panic!("install wrote no {}: {e}", sandbox.kde_mimeapps().display()));
+    assert_eq!(
+        default_for_scheme(&claimed_kde, "x-scheme-handler/nxm").as_deref(),
+        Some("nxmproxy.desktop;vortex.desktop;hd2arsenal.desktop"),
+        "nxmproxy goes to the FRONT and nobody is removed:\n{claimed_kde}"
+    );
+
+    // 3. And the same for the plain file, pre-seeded with content worth losing.
+    //    The lookup has to be group-aware, because the seeded file has an
+    //    `x-scheme-handler/nxm` line in `[Added Associations]` too, and a
     //    naive "first line matching" would read Vortex's and call the claim
     //    broken.
     let claimed = std::fs::read_to_string(sandbox.mimeapps())
@@ -719,34 +769,104 @@ fn linux_install_claims_the_scheme_in_one_file_and_buries_nobody() {
         stderr(&after)
     );
 
-    // 3. THE decisive assertion: nobody else's entry moved. Every non-blank
-    //    line that was in the file before must still be there, byte for byte.
-    //    The seeded file holds no `[Default Applications]` nxm line, so there is
-    //    nothing in it that taking the scheme was entitled to replace.
+    // 4. THE other decisive assertion: nobody else's entry moved. Every non-blank
+    //    line that was in each seeded file before must still be there, byte for
+    //    byte, and every other id must still be in its original order relative
+    //    to the others.
     for line in other_manager.lines().filter(|l| !l.trim().is_empty()) {
         assert!(
             claimed.contains(line),
             "install altered or dropped another mod manager's line {line:?}:\n{claimed}"
         );
     }
-
-    // 4. The three-file propagation GMM commits must be absent. Both files are
-    //    asserted on content, not existence, so this cannot pass by accident.
-    assert!(
-        !sandbox.kde_mimeapps().exists(),
-        "install propagated into kde-mimeapps.list, which is the forced-spread \
-         behaviour this fork exists to stop"
-    );
+    // The highest-precedence row, asserted byte for byte: our id prepended and
+    // nothing else touched. Byte equality rather than "contains the old line",
+    // because prepending is *supposed* to change that one line.
     assert_eq!(
-        std::fs::read_to_string(sandbox.data_applications().join("mimeapps.list")).unwrap(),
-        data_mimeapps,
-        "install propagated the claim into the data-level mimeapps.list; that file \
-         must be left exactly as it was found"
+        claimed_kde,
+        "[Default Applications]\n\
+         x-scheme-handler/nxm=nxmproxy.desktop;vortex.desktop;hd2arsenal.desktop;\n",
+        "the file that outranked everything is now ours at the front and byte-for-byte \
+         otherwise unchanged"
     );
 
-    // 5. And nothing else appeared at all. A cache rebuilt by
-    //    `update-desktop-database` is a cache of file contents, not a record of
-    //    the user's choice, so it is not in this list.
+    // 5. The data-level file is a lower-precedence row and is claimed too, the
+    //    same way and with the same promise.
+    let claimed_data = std::fs::read_to_string(sandbox.data_applications().join("mimeapps.list"))
+        .unwrap_or_else(|e| panic!("install wrote no data-level mimeapps.list: {e}"));
+    assert_eq!(
+        default_for_scheme(&claimed_data, "x-scheme-handler/nxm").as_deref(),
+        Some("nxmproxy.desktop;othermanager.desktop"),
+        "the deprecated data row is in the order too, and it buries nobody:\n{claimed_data}"
+    );
+
+    // 6. **Every row we own is written, and nothing outside it is.** Named
+    //    explicitly rather than counted: "10 of 10" would also be 10 of 10 for
+    //    ten wrong paths. The two roots below are `$XDG_CONFIG_HOME` and
+    //    `$XDG_DATA_HOME/applications`, each carrying a row per discovered
+    //    `$desktop` plus the plain one.
+    let out = stdout(&after);
+    let claim_line = out
+        .lines()
+        .find(|l| l.starts_with("claimed x-scheme-handler/nxm in "))
+        .unwrap_or_else(|| panic!("install reported no claim at all:\n{out}"));
+    let mut expected: Vec<String> = vec![];
+    for root in [sandbox.xdg_config_home(), sandbox.data_applications()] {
+        for name in ["kde", "gnome", "xfce", "lxqt"] {
+            expected.push(
+                root.join(format!("{name}-mimeapps.list"))
+                    .display()
+                    .to_string(),
+            );
+        }
+        expected.push(root.join("mimeapps.list").display().to_string());
+    }
+    expected.sort();
+
+    // The two roots the desktop reads and we do not write: `$XDG_CONFIG_DIRS` and
+    // `$XDG_DATA_DIRS`. Nothing under either may be created, because they belong
+    // to the machine - `/usr/share/applications` is root's, `$XDG_DATA_DIRS`
+    // begins here with a Flatpak export directory flatpak owns, and a `sudo
+    // nxmproxy install` would silently reassign the scheme for every user on the
+    // box. They cannot outrank `$XDG_CONFIG_HOME` in any case.
+    for root in [
+        sandbox.root.join("home/etc-xdg"),
+        sandbox.root.join("data/dirs/applications"),
+    ] {
+        for name in ["kde", "gnome", "xfce", "lxqt"] {
+            let system_row = root.join(format!("{name}-mimeapps.list"));
+            assert!(
+                !system_row.exists(),
+                "install wrote the system row {} - it is nobody's to write",
+                system_row.display()
+            );
+        }
+        assert!(
+            !root.join("mimeapps.list").exists(),
+            "install created a mimeapps.list under a system root"
+        );
+    }
+    assert!(
+        claim_line.contains("in 10 of 10 files: kde gnome xfce lxqt"),
+        "both of our roots, all four desktop names and the plain row: {claim_line}"
+    );
+    for path in &expected {
+        assert!(
+            Path::new(path).exists(),
+            "a row we own was never written: {path}\n{claim_line}"
+        );
+    }
+
+    // 7. And nothing appeared that is not association state or ours. A cache
+    //    rebuilt by `update-desktop-database` is a cache of file contents, not a
+    //    record of the user's choice, so it is not in this list.
+    //
+    //    **This is the assertion that caught the scope change.** While `install`
+    //    wrote the whole eight-row table, this list held ten files under
+    //    `data/dirs/applications` and `home/etc-xdg` and nothing questioned it -
+    //    a user-level tool creating files in root's and flatpak's directories on
+    //    every install, and changing the default application for the whole
+    //    machine the moment anyone ran it with `sudo`.
     let mut added: Vec<String> = sandbox
         .all_files()
         .into_iter()
@@ -762,27 +882,39 @@ fn linux_install_claims_the_scheme_in_one_file_and_buries_nobody() {
     // Sorted: directory read order is filesystem order and is not stable, so an
     // unsorted comparison would fail intermittently for no reason at all.
     added.sort();
+    // The three seeded files are absent from this list by construction: they were
+    // already in `before`. Everything else the sweep created must be here, and
+    // every system root is now empty of anything we made.
     assert_eq!(
         added,
         vec![
             "config/config.toml".to_string(),
+            "data/applications/gnome-mimeapps.list".to_string(),
+            "data/applications/kde-mimeapps.list".to_string(),
+            "data/applications/lxqt-mimeapps.list".to_string(),
             "data/applications/nxmproxy.desktop".to_string(),
+            "data/applications/xfce-mimeapps.list".to_string(),
+            "home/.config/gnome-mimeapps.list".to_string(),
+            "home/.config/lxqt-mimeapps.list".to_string(),
+            "home/.config/xfce-mimeapps.list".to_string(),
         ],
-        "install must create its desktop entry and nothing else"
+        "every row we own, and nothing under a root that belongs to the machine"
     );
     assert!(panic_markers(&after).is_empty(), "{}", stderr(&after));
 }
 
-/// The hand-written claim path - the one used when `xdg-mime` is not installed -
-/// makes the same promise about other mod managers, and does it in nxmproxy's
-/// own file editor rather than a third party's.
+/// The claim needs nothing installed but Rust.
 ///
-/// A control proved this was the untested path: breaking the editor left this
-/// file green while `xdg-mime` did the work on a normal machine. This is the
-/// test that closes it, and it runs on every Linux CI run.
+/// `install` used to delegate the whole edit to `xdg-mime`, and `xdg-mime` has
+/// no verb for removing one - and, verified directly against xdg-utils 1.1.3, it
+/// **exits 0 while writing nothing** when the target directory is missing. A
+/// headless container has no `xdg-mime`, and the code path that ran there was
+/// hand-written and ran nowhere else. So the whole sweep is one pure text
+/// function now, and this is the only path there is: PATH emptied, no desktop
+/// tools, and the claim still lands in every file.
 #[cfg(target_os = "linux")]
 #[test]
-fn the_fallback_claim_path_buries_nobody_either() {
+fn the_claim_needs_no_third_party_tool_and_buries_nobody() {
     let sandbox = Sandbox::new("fallback");
     let _lock = install_sandbox(&sandbox);
     std::fs::create_dir_all(sandbox.xdg_config_home()).unwrap();
@@ -791,6 +923,8 @@ fn the_fallback_claim_path_buries_nobody_either() {
     let other_manager = "[Added Associations]\nx-scheme-handler/nxm=vortex.desktop;\n\n\
                          [Default Applications]\nx-scheme-handler/http=firefox.desktop;\n";
     std::fs::write(sandbox.mimeapps(), other_manager).unwrap();
+    let kde_rival = "[Default Applications]\nx-scheme-handler/nxm=vortex.desktop;\n";
+    std::fs::write(sandbox.kde_mimeapps(), kde_rival).unwrap();
 
     let installed = run_without_xdg_mime(&sandbox, &["install"]);
     assert_eq!(
@@ -801,67 +935,86 @@ fn the_fallback_claim_path_buries_nobody_either() {
         stderr(&installed)
     );
     assert!(
-        stdout(&installed).contains("note:"),
-        "the user must be told the desktop tool was not available: {}",
+        !stdout(&installed).contains("note:"),
+        "there is no longer a third-party tool to fall back from, and no note to \
+         print about one: {}",
         stdout(&installed)
     );
 
+    // Both files are claimed, with the same promise in each: our id at the front,
+    // the other manager's still listed behind it.
+    for (file, want) in [
+        (sandbox.mimeapps(), "nxmproxy.desktop"),
+        (sandbox.kde_mimeapps(), "nxmproxy.desktop;vortex.desktop"),
+    ] {
+        let claimed = std::fs::read_to_string(&file).unwrap();
+        assert_eq!(
+            default_for_scheme(&claimed, "x-scheme-handler/nxm").as_deref(),
+            Some(want),
+            "the claim did not take, or Vortex was buried instead of ranked \
+             behind:\n{claimed}"
+        );
+    }
     let claimed = std::fs::read_to_string(sandbox.mimeapps()).unwrap();
-    assert_eq!(
-        default_for_scheme(&claimed, "x-scheme-handler/nxm").as_deref(),
-        Some("nxmproxy.desktop"),
-        "the fallback did not claim the scheme:\n{claimed}"
-    );
     for line in other_manager.lines().filter(|l| !l.trim().is_empty()) {
         assert!(
             claimed.contains(line),
-            "the fallback altered another mod manager's line {line:?}:\n{claimed}"
+            "the hand-written claim altered another mod manager's line {line:?}:\n{claimed}"
         );
     }
-    assert!(
-        !sandbox.kde_mimeapps().exists(),
-        "the fallback propagated into kde-mimeapps.list too"
-    );
 
-    // And it reverses, through the same editor.
+    // And it reverses, through the same function, in every file.
     let removed = run_without_xdg_mime(&sandbox, &["uninstall"]);
     assert_eq!(code(&removed), 3);
     let after = std::fs::read_to_string(sandbox.mimeapps()).unwrap();
     assert_eq!(
         default_for_scheme(&after, "x-scheme-handler/nxm"),
         None,
-        "the fallback left our claim behind:\n{after}"
+        "the claim left our entry behind:\n{after}"
     );
     assert!(
         after.contains("x-scheme-handler/nxm=vortex.desktop;")
             && after.contains("x-scheme-handler/http=firefox.desktop;"),
-        "the fallback took another manager's entries with ours:\n{after}"
+        "the removal took another manager's entries with ours:\n{after}"
+    );
+    // The KDE file held nothing but Vortex before us, so ours came out and
+    // Vortex is exactly as it was.
+    let kde_after = std::fs::read_to_string(sandbox.kde_mimeapps()).unwrap();
+    assert_eq!(
+        kde_after, kde_rival,
+        "removing our own id must restore the previous bytes exactly, which is \
+         only true because the claim prepends instead of replacing:\n{kde_after}"
     );
 }
 
-/// `uninstall` reverses the claim: nxmproxy's own id goes and nothing else does.
+/// `uninstall` reverses the claim, in every file `install` wrote to, and
+/// restores the previous bytes exactly.
 ///
 /// This is the half that makes `install` safe to offer. A claim nxmproxy cannot
 /// take back is indistinguishable from the greed it replaced.
 ///
-/// Note what is deliberately NOT asserted: that Vortex is restored as the
-/// default. It cannot be. `xdg-mime default` *replaces* the value rather than
-/// appending to it, and nothing records what was there before. What survives is
-/// Vortex's own `[Added Associations]` entry, which is how the desktop learns it
-/// can offer Vortex again - and `uninstall` says so rather than pretending.
+/// **Exact restoration is new, and it is a consequence of prepending rather than
+/// replacing.** `xdg-mime default` overwrote the value for the key, so nothing
+/// recorded what was there and Vortex could not be put back. A prepend is
+/// invertible: nxmproxy goes to the front of a list, the others keep their order,
+/// and taking it off the front leaves what was there. So the fixture below is
+/// compared byte for byte, not by a "Vortex is still somewhere in here" check.
 #[cfg(target_os = "linux")]
 #[test]
-fn linux_uninstall_removes_only_our_line() {
+fn linux_uninstall_restores_every_file_it_claimed() {
     let sandbox = Sandbox::new("uninstall-linux");
     let _lock = install_sandbox(&sandbox);
     std::fs::create_dir_all(sandbox.xdg_config_home()).unwrap();
+    std::fs::create_dir_all(sandbox.data_applications()).unwrap();
 
-    std::fs::write(
-        sandbox.mimeapps(),
-        "[Added Associations]\nx-scheme-handler/nxm=vortex.desktop;\n\n\
-         [Default Applications]\nx-scheme-handler/http=firefox.desktop;\n",
-    )
-    .unwrap();
+    // Two files seeded with content worth losing, one of them the row that
+    // outranks everything.
+    let seeded = "[Added Associations]\nx-scheme-handler/nxm=vortex.desktop;\n\n\
+                  [Default Applications]\nx-scheme-handler/http=firefox.desktop;\n";
+    std::fs::write(sandbox.mimeapps(), seeded).unwrap();
+    let kde_seeded =
+        "[Default Applications]\nx-scheme-handler/nxm=vortex.desktop;hd2arsenal.desktop;\n";
+    std::fs::write(sandbox.kde_mimeapps(), kde_seeded).unwrap();
 
     assert_eq!(
         code(&run(&sandbox, &["install"])),
@@ -869,28 +1022,59 @@ fn linux_uninstall_removes_only_our_line() {
         "no manager yet, so not done"
     );
 
-    let claimed = std::fs::read_to_string(sandbox.mimeapps()).unwrap();
-    assert_eq!(
-        default_for_scheme(&claimed, "x-scheme-handler/nxm").as_deref(),
-        Some("nxmproxy.desktop"),
-        "no claim was made:\n{claimed}"
-    );
+    for (file, want) in [
+        (sandbox.mimeapps(), "nxmproxy.desktop"),
+        (
+            sandbox.kde_mimeapps(),
+            "nxmproxy.desktop;vortex.desktop;hd2arsenal.desktop",
+        ),
+    ] {
+        let claimed = std::fs::read_to_string(&file).unwrap();
+        assert_eq!(
+            default_for_scheme(&claimed, "x-scheme-handler/nxm").as_deref(),
+            Some(want),
+            "no claim was made in {}:\n{claimed}",
+            file.display()
+        );
+    }
 
     let removed = run(&sandbox, &["uninstall"]);
     assert_eq!(
         code(&removed),
         3,
-        "uninstall is honest that the default is not restored: {}{}",
+        "uninstall is honest that the user has to choose again: {}{}",
         stdout(&removed),
         stderr(&removed)
     );
 
-    let after = std::fs::read_to_string(sandbox.mimeapps()).unwrap();
+    // Per-location, byte for byte. Not "Vortex is still mentioned somewhere".
     assert_eq!(
-        default_for_scheme(&after, "x-scheme-handler/nxm"),
-        None,
-        "uninstall left our claim behind:\n{after}"
+        std::fs::read_to_string(sandbox.mimeapps()).unwrap(),
+        seeded,
+        "the user's own file is not exactly as it was found"
     );
+    assert_eq!(
+        std::fs::read_to_string(sandbox.kde_mimeapps()).unwrap(),
+        kde_seeded,
+        "the file that outranks everything is not exactly as it was found"
+    );
+
+    // A file that held nothing but nxmproxy's own line is one `install` created,
+    // and it goes away rather than lingering as an empty group. A
+    // `$desktop-mimeapps.list` that did not exist before must not exist after.
+    for name in ["gnome", "xfce", "lxqt"] {
+        let path = sandbox
+            .xdg_config_home()
+            .join(format!("{name}-mimeapps.list"));
+        assert!(
+            !path.exists(),
+            "{} is a file nxmproxy created and should have removed",
+            path.display()
+        );
+    }
+
+    // Nothing else moved: an unrelated scheme and another group survive.
+    let after = std::fs::read_to_string(sandbox.mimeapps()).unwrap();
     assert!(
         after.contains("x-scheme-handler/nxm=vortex.desktop;"),
         "uninstall took the other manager's own nxm entry with ours:\n{after}"
@@ -902,6 +1086,372 @@ fn linux_uninstall_removes_only_our_line() {
     assert!(
         after.contains("[Added Associations]") && after.contains("[Default Applications]"),
         "uninstall removed a group:\n{after}"
+    );
+}
+
+/// Run the **desktop's own resolver** against the sandbox and report what it
+/// says.
+///
+/// Not a re-implementation. `xdg-mime query default` walks the specification's
+/// table for itself, loads the named desktop files, and checks each one declares
+/// the type - so it is a third opinion that shares no code with nxmproxy's
+/// [`Chain`](platform::linux) reader and no code with this test. Reading our own
+/// file back would only ever prove we wrote our own file.
+///
+/// Prints a note and returns `None` when `xdg-mime` is not installed, rather
+/// than skipping silently, so a run that proved less than it looks like says so.
+#[cfg(target_os = "linux")]
+fn desktop_says(sandbox: &Sandbox) -> Option<String> {
+    desktop_says_on(sandbox, "KDE")
+}
+
+/// [`desktop_says`] under a named `$XDG_CURRENT_DESKTOP`, so the same fixture can
+/// be asked what the desktop answers when it is a different session than the one
+/// that installed.
+#[cfg(target_os = "linux")]
+fn desktop_says_on(sandbox: &Sandbox, desktop: &str) -> Option<String> {
+    let out = Command::new("xdg-mime")
+        .args(["query", "default", "x-scheme-handler/nxm"])
+        .current_dir(sandbox.root.join("home"))
+        .env("HOME", sandbox.root.join("home"))
+        .env("XDG_CONFIG_HOME", sandbox.root.join("home").join(".config"))
+        .env("XDG_DATA_HOME", sandbox.root.join("data"))
+        .env("XDG_DATA_DIRS", sandbox.root.join("data").join("dirs"))
+        .env("XDG_CONFIG_DIRS", sandbox.root.join("home").join("etc-xdg"))
+        .env("XDG_CURRENT_DESKTOP", desktop)
+        .output();
+    match out {
+        Ok(out) if out.status.success() => {
+            Some(String::from_utf8_lossy(&out.stdout).trim().to_string())
+        }
+        Ok(out) => {
+            eprintln!(
+                "note: xdg-mime query failed: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            None
+        }
+        Err(e) => {
+            eprintln!(
+                "note: xdg-mime is not installed here ({e}); the desktop-level \
+                      resolution is not being proven on this machine"
+            );
+            None
+        }
+    }
+}
+
+/// The claim, checked by the desktop rather than by us.
+///
+/// This is the test the whole ticket exists for. Before it, nxmproxy wrote one
+/// line into `~/.config/mimeapps.list`, GameMod Manager wrote
+/// `~/.config/kde-mimeapps.list`, the specification ranks the second file above
+/// the first, and **KDE opened GameMod Manager while `install` exited 0**.
+///
+/// Every step asserts something the step before did not:
+/// 1. GMM alone in the higher file wins, even with nxmproxy first in the lower
+///    one - the bug, reproduced;
+/// 2. deleting the higher file by hand fixes it - which is what the user did,
+///    and why it looked like a fluke;
+/// 3. `install` puts nxmproxy first in the higher file too, and the desktop says
+///    nxmproxy;
+/// 4. GMM writing the lower file *afterwards* loses, because a lower row cannot
+///    beat a higher one.
+#[cfg(target_os = "linux")]
+#[test]
+fn the_desktop_itself_names_nxmproxy_after_install() {
+    let sandbox = Sandbox::new("desktop-resolve");
+    let _lock = install_sandbox(&sandbox);
+    std::fs::create_dir_all(sandbox.xdg_config_home()).unwrap();
+    std::fs::create_dir_all(sandbox.data_applications()).unwrap();
+    assert_eq!(
+        code(&run(
+            &sandbox,
+            &["register", "somewhere", bin_path(), "--", "%1"]
+        )),
+        0
+    );
+
+    // Two applications, both published, both declaring the scheme. Only the
+    // desktop entry decides this - `xdg-mime` refuses an id whose `.desktop` file
+    // is missing or does not declare the type, exactly as the specification says.
+    //
+    // **Both of them have to be published, not just the rival.** This fixture
+    // reads the desktop *before* `install` runs, and `install` is what writes
+    // `nxmproxy.desktop`. With only GMM published, the row naming nxmproxy in
+    // `mimeapps.list` was a claim against an application that was not installed,
+    // so the desktop skipped it - and "removing the higher file restores nxmproxy"
+    // was asserting a fallback that only happens to have picked nxmproxy because
+    // it was the sole installed handler for the type.
+    publish_nxm_app(&sandbox, "gamemodmanager-nxm", "GameModManager");
+    publish_nxm_app(&sandbox, "nxmproxy", "NXM Proxy");
+
+    // GMM's state: first in the desktop-specific file, which outranks the plain
+    // one.
+    std::fs::write(
+        sandbox.kde_mimeapps(),
+        "[Default Applications]\nx-scheme-handler/nxm=gamemodmanager-nxm.desktop;\n",
+    )
+    .unwrap();
+    std::fs::write(
+        sandbox.mimeapps(),
+        "[Default Applications]\nx-scheme-handler/nxm=nxmproxy.desktop;\n",
+    )
+    .unwrap();
+    let Some(said) = desktop_says(&sandbox) else {
+        return;
+    };
+    assert_eq!(
+        said, "gamemodmanager-nxm.desktop",
+        "the bug being fixed, reproduced: the desktop-specific file outranks the \
+         plain one, so nxmproxy being first in the lower file is worth nothing"
+    );
+
+    // **And our own reader must say the same thing, here, before `install`.**
+    // This is the false green the whole change exists to end, and it is the
+    // direction that costs the user: the desktop opens GMM, nxmproxy is in the
+    // lower row, and a reader that skipped `$desktop-mimeapps.list` answers
+    // `nxmproxy handles nxm://: yes`. The assertion below the `install` only ever
+    // checked the *other* direction - our reader claiming a loss while the
+    // desktop claims a win - so narrowing the read chain to one file went green
+    // here and red three tests over. A control found the gap; this closes it.
+    let before_install = stdout(&run(&sandbox, &["test"]));
+    assert!(
+        before_install.contains("nxmproxy handles nxm://: no")
+            && before_install.contains("winner: gamemodmanager-nxm.desktop")
+            && before_install.contains("kde-mimeapps.list"),
+        "`test` must not report a win the desktop has already given away:\n{before_install}"
+    );
+    assert_eq!(
+        code(&run(&sandbox, &["test"])),
+        3,
+        "and it exits 3 while saying so"
+    );
+
+    // What the user did by hand: delete the higher file. It works, which is why
+    // the problem looked intermittent and cost an entire session.
+    std::fs::remove_file(sandbox.kde_mimeapps()).unwrap();
+    assert_eq!(
+        desktop_says(&sandbox).as_deref(),
+        Some("nxmproxy.desktop"),
+        "removing the higher file restores nxmproxy - the manual fix, and the reason \
+         the cause was not obvious"
+    );
+
+    // `install`. It writes the higher file as well, and now the desktop agrees.
+    assert_eq!(
+        code(&run(&sandbox, &["install"])),
+        0,
+        "a registered manager and a verified claim: {}{}",
+        stdout(&run(&sandbox, &["install"])),
+        stderr(&run(&sandbox, &["install"]))
+    );
+    assert_eq!(
+        desktop_says(&sandbox).as_deref(),
+        Some("nxmproxy.desktop"),
+        "install wrote every row and the desktop still says somebody else"
+    );
+
+    // And GMM writing the file it was told to stop writing cannot take it back,
+    // because a lower-precedence row never beats a higher one.
+    std::fs::write(
+        sandbox.mimeapps(),
+        "[Default Applications]\nx-scheme-handler/nxm=gamemodmanager-nxm.desktop;\n",
+    )
+    .unwrap();
+    assert_eq!(
+        desktop_says(&sandbox).as_deref(),
+        Some("nxmproxy.desktop"),
+        "a rival writing a LOWER row loses to a claim in a higher one"
+    );
+    let tested = stdout(&run(&sandbox, &["test"]));
+    assert!(
+        tested.contains("nxmproxy handles nxm://: yes"),
+        "and our own reader agrees with the desktop, which is the point of reading \
+         the same chain: {tested}"
+    );
+
+    // **Where it is not true, stated plainly rather than implied away.** GMM
+    // writing the *same* desktop-specific row does win - there is no precedence
+    // left to appeal to, and no program may write another program's entry out of
+    // it. What must hold is that we say so: `test` reports the loss and exits 3
+    // rather than carrying on claiming a win.
+    std::fs::write(
+        sandbox.kde_mimeapps(),
+        "[Default Applications]\nx-scheme-handler/nxm=gamemodmanager-nxm.desktop;\n",
+    )
+    .unwrap();
+    assert_eq!(
+        desktop_says(&sandbox).as_deref(),
+        Some("gamemodmanager-nxm.desktop"),
+        "the honest limit of any claim: same row, later writer wins"
+    );
+    let out = run(&sandbox, &["test"]);
+    let text = stdout(&out);
+    assert!(
+        text.contains("nxmproxy handles nxm://: no")
+            && text.contains("winner: gamemodmanager-nxm.desktop")
+            && text.contains("kde-mimeapps.list"),
+        "a rival writing the same row DOES win, and the user must be told which \
+         file it wrote - the one place a claim cannot be defended is the one place \
+         it must be honest:\n{text}"
+    );
+    assert_eq!(
+        code(&out),
+        3,
+        "and exiting 0 over it would be the exact false green this command exists \
+         to end:\n{text}"
+    );
+}
+
+/// A location the sweep cannot write is **named**, not skipped.
+///
+/// `xdg-mime default` was verified against xdg-utils 1.1.3 to exit 0 and write
+/// **nothing** when the target directory is missing, and a directory the user
+/// does not own fails the same way with no error code carrying it. Every write is
+/// read back, and a location that did not take is reported with the path and the
+/// reason - because "the sweep reported 10 of 10" and "the sweep reported 4 of 10
+/// and named the 6" are different machines and only one of them works.
+///
+/// The refusal has to be produced somewhere we genuinely write. It used to be
+/// produced in `$XDG_DATA_DIRS`, which is not a location we write any more - so
+/// the sweep had nothing left to refuse and the case had quietly stopped existing
+/// while still passing. `~/.config` is both a location we write and the one a
+/// real profile can plausibly lock down.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_location_that_cannot_be_claimed_is_named_with_the_reason() {
+    let sandbox = Sandbox::new("refused-location");
+    let _lock = install_sandbox(&sandbox);
+    std::fs::create_dir_all(sandbox.xdg_config_home()).unwrap();
+    std::fs::create_dir_all(sandbox.data_applications()).unwrap();
+
+    // The file GMM writes and the one `xdg-mime` writes, both in a directory the
+    // user does not own.
+    let seeded = sandbox.mimeapps();
+    std::fs::write(
+        &seeded,
+        "[Default Applications]\nx-scheme-handler/http=firefox.desktop;\n",
+    )
+    .unwrap();
+    let lock = ReadOnly::lock(&sandbox.xdg_config_home(), &seeded);
+    if !lock.held() {
+        eprintln!(
+            "note: the sandbox is still writable despite the mode bits (root?); \
+                  the refusal case cannot be produced here"
+        );
+        return;
+    }
+
+    let out = run(&sandbox, &["install"]);
+    let text = stdout(&out);
+    assert!(
+        text.contains(&format!("  refused {}: ", seeded.display())),
+        "a location that could not be claimed is named, with the path, not \
+         silently skipped:\n{text}"
+    );
+    assert!(
+        text.contains("could not create") || text.contains("could not write"),
+        "and with the reason, so the reader knows whether to sudo, to chmod, or to \
+         stop caring:\n{text}"
+    );
+    // The count in the header has to account for the failure. A summary claiming
+    // full coverage over a sweep that lost files is the silent skip this test
+    // exists to prevent.
+    assert!(
+        text.contains("of 10 files: kde"),
+        "and still say how many rows it consulted, so the loss is a number and not \
+         a disappearance:\n{text}"
+    );
+    assert!(
+        !text.contains("in 10 of 10 files:"),
+        "the summary count must show the loss:\n{text}"
+    );
+    // Nothing of anyone else's was lost on the way. The read-only file is exactly
+    // the case where a careless implementation truncates it before finding out.
+    drop(lock);
+    assert_eq!(
+        std::fs::read_to_string(&seeded).unwrap(),
+        "[Default Applications]\nx-scheme-handler/http=firefox.desktop;\n",
+        "a refused location is left byte for byte as it was found - refusing to \
+         write is the whole point"
+    );
+    // And the rows that did take are enough to win anyway, which is what sweeping
+    // every row buys: one unwritable directory does not cost the user their link.
+    assert_eq!(
+        desktop_says(&sandbox).as_deref(),
+        Some("nxmproxy.desktop"),
+        "the rows that did take are still enough to win"
+    );
+}
+
+/// A `$desktop-mimeapps.list` that exists on disk is claimed **even when that
+/// desktop is not the one running**.
+///
+/// This is the machine the whole change is for. A user has KDE installed, has
+/// run it, and is currently in GNOME - or is in a TTY, or over SSH, where
+/// `$XDG_CURRENT_DESKTOP` is unset entirely. GMM's `kde-mimeapps.list` is sitting
+/// there holding the scheme, and it is the highest-precedence row the moment the
+/// user logs back into KDE. A sweep driven only by `$XDG_CURRENT_DESKTOP` writes
+/// every file that session will consult and none of the ones that session will
+/// consult *later*, which is the same bug with a different trigger.
+///
+/// Every other test pins `XDG_CURRENT_DESKTOP=KDE`, so this path - discovery of
+/// a desktop by the file it already has - had no end-to-end coverage at all. The
+/// unit test that walks the four roots is not a substitute: the claim is a file
+/// write, and the write is what has to be proven.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_desktop_file_that_already_exists_is_claimed_while_another_desktop_runs() {
+    let sandbox = Sandbox::new("foreign-desktop");
+    let _lock = install_sandbox(&sandbox);
+    std::fs::create_dir_all(sandbox.xdg_config_home()).unwrap();
+    std::fs::create_dir_all(sandbox.data_applications()).unwrap();
+    publish_nxm_app(&sandbox, "gamemodmanager-nxm", "GameModManager");
+
+    // GMM's row, in a Cinnamon profile, on a machine whose running session is
+    // GNOME. **`x-cinnamon` is deliberately not one of the four names the
+    // specification's own text offers** (`kde`, `gnome`, `xfce`, `lxqt`), because
+    // that list is an open set and hardcoding it is exactly the bug: with `kde`
+    // as the stand-in this test passed with the entire on-disk discovery disabled,
+    // because `kde` is in that hardcoded list and the row was written anyway.
+    // Nothing but walking the four roots and looking finds this one.
+    let cinnamon = sandbox.xdg_config_home().join("x-cinnamon-mimeapps.list");
+    std::fs::write(
+        &cinnamon,
+        "[Default Applications]\nx-scheme-handler/nxm=gamemodmanager-nxm.desktop;\n",
+    )
+    .unwrap();
+    assert_eq!(
+        code(&run(
+            &sandbox,
+            &["register", "somewhere", "/bin/true", "--", "%1"]
+        )),
+        0
+    );
+
+    let installed = run_on_desktop(&sandbox, "GNOME", &["install"]);
+    assert_eq!(
+        code(&installed),
+        0,
+        "the claim took on the rows this session reads: {}{}",
+        stdout(&installed),
+        stderr(&installed)
+    );
+    let claimed = std::fs::read_to_string(&cinnamon).unwrap();
+    assert_eq!(
+        default_for_scheme(&claimed, "x-scheme-handler/nxm").as_deref(),
+        Some("nxmproxy.desktop;gamemodmanager-nxm.desktop"),
+        "the Cinnamon row is claimed too, found on disk and not from \
+         XDG_CURRENT_DESKTOP, and GMM keeps its rank:\n{claimed}"
+    );
+
+    // And it is a real claim, not a line in a file: log into Cinnamon and the
+    // desktop, which consults that row first, opens nxmproxy.
+    assert_eq!(
+        desktop_says_on(&sandbox, "X-Cinnamon").as_deref(),
+        Some("nxmproxy.desktop"),
+        "a session that is not running must still find the row already claimed"
     );
 }
 
@@ -1137,25 +1687,64 @@ const BYPASSED_MIMEAPPS: &str = "[Added Associations]\n\
                                    [Default Applications]\n\
                                    x-scheme-handler/nxm=gamemodmanager-nxm.desktop;\n";
 
+/// Publish `id` as an **installed** application that declares the nxm scheme.
+///
+/// A `mimeapps.list` line naming an application with no desktop entry on disk is
+/// not a claim on anything, and both xdg-mime and our own reader skip it - the
+/// specification says to load the named file and verify the association before
+/// accepting a default, and to carry on to the next file when it is absent.
+/// Verified directly: with GMM's entry present `xdg-mime query default` answers
+/// `gamemodmanager-nxm.desktop`; delete the file and the identical
+/// `mimeapps.list` answers `nxmproxy.desktop`.
+///
+/// So a fixture that says "GMM holds nxm://" is only that machine if GMM is
+/// installed in it. Three tests seeded a rival that was named but never
+/// installed, the reader discarded it, our own lower row became the winner, and
+/// `install` printed "nxm:// links now open in nxmproxy." after every single
+/// write had been refused. The false green came from the fixture, not from the
+/// resolution code - which is why this is a helper every fixture calls rather
+/// than a fix to `resolve`.
+#[cfg(target_os = "linux")]
+fn publish_nxm_app(sandbox: &Sandbox, id: &str, name: &str) {
+    let dir = sandbox.data_applications();
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(
+        dir.join(format!("{id}.desktop")),
+        format!(
+            "[Desktop Entry]\nType=Application\nName={name}\n\
+             Exec=/bin/true url %u\nTerminal=false\nCategories=Utility;\n\
+             MimeType=x-scheme-handler/nxm;\n"
+        ),
+    )
+    .unwrap();
+}
+
 /// Put the conflicting file where the desktop reads it, and publish nxmproxy.
 ///
-/// `install` re-writes `[Default Applications] x-scheme-handler/nxm=nxmproxy.desktop`,
-/// which on this fixture is already there, so the claim is a no-op and the
-/// conflict the tests are about survives it - asserted below rather than
-/// assumed, because a fixture that moved is a fixture that is no longer the
-/// case.
+/// The fixture is seeded into **both** `~/.config/mimeapps.list` and
+/// `~/.config/kde-mimeapps.list`, because on a KDE session the second is the
+/// higher-precedence row and a conflict written only into the first is a
+/// conflict the desktop would never see. `install` re-writes the
+/// `[Default Applications]` value in both to put nxmproxy at the front, which on
+/// this fixture is already there - so the claim is a no-op and the conflict the
+/// tests are about survives it.
 ///
-/// The install itself exits 3: the scheme is held, but nothing is registered to
-/// forward a link to, and that is a separate fact from this one.
+/// The install itself exits 0: GMM is published in this fixture, so it is a
+/// discovered manager, nxmproxy registers it, and there is nothing left for the
+/// user to do. It used to exit 3 because the rival was named in a `mimeapps`
+/// file but never published as an application - see [`publish_nxm_app`] - and
+/// "no mod manager to forward to" was a fact about the fixture, not the machine.
 #[cfg(target_os = "linux")]
 fn seeded_conflict(sandbox: &Sandbox) {
     std::fs::create_dir_all(sandbox.xdg_config_home()).unwrap();
+    publish_nxm_app(sandbox, "gamemodmanager-nxm", "GameModManager");
     std::fs::write(sandbox.mimeapps(), CONFLICTING_MIMEAPPS).unwrap();
+    std::fs::write(sandbox.kde_mimeapps(), CONFLICTING_MIMEAPPS).unwrap();
     let installed = run(sandbox, &["install"]);
     assert_eq!(
         code(&installed),
-        3,
-        "holds the scheme, but has no mod manager to forward to: {}{}",
+        0,
+        "the claim holds and a manager is registered: {}{}",
         stdout(&installed),
         stderr(&installed)
     );
@@ -1164,11 +1753,25 @@ fn seeded_conflict(sandbox: &Sandbox) {
         "nxmproxy does hold the scheme on this fixture: {}",
         stdout(&installed)
     );
-    assert_eq!(
-        std::fs::read_to_string(sandbox.mimeapps()).unwrap(),
-        CONFLICTING_MIMEAPPS,
-        "install changed the fixture, so it is no longer the case under test"
-    );
+    // Compared semantically, not byte for byte, and the reason is the claim
+    // itself: `install` rewrites the value to `id=nxmproxy.desktop;` and the
+    // fixture left the trailing `;` off. The conflict - which group each
+    // application is in - is the fact under test, and it is asserted on.
+    for file in [sandbox.mimeapps(), sandbox.kde_mimeapps()] {
+        let after = std::fs::read_to_string(&file).unwrap();
+        assert_eq!(
+            default_for_scheme(&after, "x-scheme-handler/nxm").as_deref(),
+            Some("nxmproxy.desktop"),
+            "install changed who wins in {}: {after}",
+            file.display()
+        );
+        assert!(
+            after
+                .contains("[Added Associations]\nx-scheme-handler/nxm=gamemodmanager-nxm.desktop;"),
+            "install moved the conflict's other group in {}: {after}",
+            file.display()
+        );
+    }
 }
 
 /// `test` explains the whole resolution, and the answer can be checked against
@@ -1188,24 +1791,49 @@ fn test_explains_a_scheme_two_applications_both_declare() {
     let tested = run(&sandbox, &["test"]);
     assert_eq!(code(&tested), 0, "{}{}", stdout(&tested), stderr(&tested));
 
-    let mimeapps = sandbox.mimeapps();
+    // The chain, in the specification's order. `$XDG_CURRENT_DESKTOP=KDE` in the
+    // sandbox, so `~/.config/kde-mimeapps.list` is row 1 and
+    // `~/.config/mimeapps.list` is row 2 - and the winner is read out of row 1.
+    // Asserting the exact stream is what makes the ORDER falsifiable: a chain
+    // with the right ten rows in the wrong sequence is still a desktop that
+    // opens GMM.
+    // Only the rows we own exist, because only the rows we own are written. The
+    // two system roots are absent from this list for the first time - and absent
+    // from the resolution too, which is the honest consequence: a chain that
+    // printed a row for a file nobody has is a chain nobody can check.
+    let rows: Vec<(PathBuf, bool)> = vec![
+        (sandbox.kde_mimeapps(), true),
+        (sandbox.mimeapps(), true),
+        (sandbox.data_applications().join("kde-mimeapps.list"), false),
+        (sandbox.data_applications().join("mimeapps.list"), false),
+    ];
+    let mut expected = String::from(
+        "registered: true\n\
+         nxm:// handler: nxmproxy.desktop\n\
+         nxmproxy handles nxm://: yes\n\
+         nxm:// resolution, highest precedence first:\n",
+    );
+    for (path, conflicted) in &rows {
+        expected.push_str(&format!(
+            "  Default Applications   nxmproxy.desktop  <- {}\n",
+            path.display()
+        ));
+        if *conflicted {
+            expected.push_str(&format!(
+                "  Added Associations     gamemodmanager-nxm.desktop  <- {}\n",
+                path.display()
+            ));
+        }
+    }
+    expected.push_str(
+        "  winner: nxmproxy.desktop - [Default Applications] outranks [Added Associations]\n\
+         \x20 declared by more than one application: nxmproxy.desktop, gamemodmanager-nxm.desktop\n",
+    );
     assert_eq!(
         stdout(&tested),
-        format!(
-            "registered: true\n\
-             nxm:// handler: nxmproxy.desktop\n\
-             nxmproxy handles nxm://: yes\n\
-             nxm:// resolution, highest precedence first:\n\
-             \x20 Default Applications   nxmproxy.desktop  <- {mimeapps}\n\
-             \x20 Added Associations     gamemodmanager-nxm.desktop  <- {mimeapps}\n\
-             \x20 winner: nxmproxy.desktop - [Default Applications] outranks \
-             [Added Associations]\n\
-             \x20 declared by more than one application: nxmproxy.desktop, \
-             gamemodmanager-nxm.desktop\n",
-            mimeapps = mimeapps.display()
-        ),
-        "the chain must name every candidate, its file, its group, the winner and \
-         the rule"
+        expected,
+        "the chain must name every candidate, its file, its group, the winner and the \
+         rule"
     );
 }
 
@@ -1222,15 +1850,16 @@ fn test_exits_truthfully_when_registered_but_bypassed() {
     let _lock = install_sandbox(&sandbox);
     seeded_conflict(&sandbox);
 
-    // The user picks GameMod Manager in Settings > Default Applications. The
-    // desktop writes the default group; nxmproxy's added association, which is
-    // what `install` published it as, is untouched and still in the file.
-    std::fs::write(
-        sandbox.mimeapps(),
-        "[Added Associations]\nx-scheme-handler/nxm=nxmproxy.desktop;\n\n\
-         [Default Applications]\nx-scheme-handler/nxm=gamemodmanager-nxm.desktop;\n",
-    )
-    .unwrap();
+    // The user picks GameMod Manager in Settings > Default Applications. A KDE
+    // settings dialog writes the **desktop-specific** file - that is what it is
+    // for - so the bypass has to be written there or the desktop never sees it.
+    // This is the exact state the whole sweep exists to answer: nxmproxy is
+    // still published, it is still first in the lower-precedence file, and the
+    // one file above both says somebody else.
+    let bypassed = "[Added Associations]\nx-scheme-handler/nxm=nxmproxy.desktop;\n\n\
+                    [Default Applications]\nx-scheme-handler/nxm=gamemodmanager-nxm.desktop;\n";
+    std::fs::write(sandbox.kde_mimeapps(), bypassed).unwrap();
+    std::fs::write(sandbox.mimeapps(), bypassed).unwrap();
 
     let tested = run(&sandbox, &["test"]);
     let text = stdout(&tested);
@@ -1270,6 +1899,81 @@ fn test_exits_truthfully_when_registered_but_bypassed() {
     );
 }
 
+/// The browser is the last thing between a clicked link and nxmproxy, and it
+/// keeps its own list.
+///
+/// `xdg-mime` says nxmproxy, `install` verified it, and a link clicked in
+/// Firefox still arrives nowhere with an empty log: Firefox's own profile says
+/// `nxm` belongs to somebody else and it never asks the OS again. The OS-level
+/// answer is correct and still not the answer, so `test` has to carry the
+/// second one and stop reporting 0.
+///
+/// Linux-only because the fixture is a Linux profile layout and because the
+/// whole point is `xdg-mime`. A Flatpak browser's relocated home is used
+/// because that is where a browser actually lives on this machine.
+#[cfg(target_os = "linux")]
+#[test]
+fn test_reports_a_browser_that_decides_nxm_for_itself() {
+    let sandbox = Sandbox::new("browser-override");
+    let _lock = install_sandbox(&sandbox);
+    seeded_conflict(&sandbox);
+
+    // The state before: the OS holds the scheme for nxmproxy and nothing else
+    // is in the way, so `test` is right to exit 0. Without this, the assertion
+    // below would pass on a line printed for the wrong reason.
+    let clean = run(&sandbox, &["test"]);
+    assert_eq!(code(&clean), 0, "{}{}", stdout(&clean), stderr(&clean));
+    assert!(
+        !stdout(&clean).contains("browser override:"),
+        "nothing has decided nxm:// but nxmproxy yet: {}",
+        stdout(&clean)
+    );
+
+    // The user ticks "always do this" in Firefox one time. That writes the
+    // scheme into the profile and Firefox never consults the OS again.
+    let profile = sandbox
+        .home()
+        .join(".var/app/org.mozilla.firefox/.mozilla/firefox/8x2q.default-release");
+    std::fs::create_dir_all(&profile).unwrap();
+    let handlers = profile.join("handlers.json");
+    std::fs::write(
+        &handlers,
+        r#"{"defaultHandlersVersion":1,"mimeTypes":{},"extensions":{},
+            "schemes":{"nxm":{"action":"useHelperApp","ask":false,
+              "handlers":[{"name":"Vortex","path":"/usr/bin/vortex"}]}}}"#,
+    )
+    .unwrap();
+
+    let tested = run(&sandbox, &["test"]);
+    let text = stdout(&tested);
+    assert!(
+        text.contains("nxmproxy handles nxm://: yes"),
+        "the OS answer has not changed, and this test is only about what sits above \
+         it: {text}"
+    );
+    assert!(
+        text.contains(&format!(
+            "browser override: org.mozilla.firefox decides nxm:// for itself: \
+             /usr/bin/vortex ({})",
+            handlers.display()
+        )),
+        "one line naming the deciding application and the file to open: {text}"
+    );
+    assert_eq!(
+        text.lines()
+            .filter(|line| line.starts_with("browser override:"))
+            .count(),
+        1,
+        "one browser, one line - this is the compactness rule: {text}"
+    );
+    assert_eq!(
+        code(&tested),
+        3,
+        "the OS would open nxmproxy and the browser would not, and exiting 0 over \
+         that is the false green this line exists to end: {text}"
+    );
+}
+
 /// `install` must verify, not believe.
 ///
 /// The reachable way to get here is not a mock: `xdg-mime` on this machine is a
@@ -1293,6 +1997,8 @@ fn install_says_plainly_when_it_could_not_take_the_claim() {
     // observed, and the read back at the end honestly reported the claim as
     // taken. The test was asserting the opposite of what it was named for.
     std::fs::write(sandbox.mimeapps(), BYPASSED_MIMEAPPS).unwrap();
+    // The rival has to be installed or it is not a rival: see [`publish_nxm_app`].
+    publish_nxm_app(&sandbox, "gamemodmanager-nxm", "GameModManager");
 
     // **Deny the write, then prove the denial.** This test used to write the
     // fixture, find the sandbox was still writable, print a note and `return` -
@@ -1378,9 +2084,20 @@ fn list_json_carries_the_resolution_the_terminal_prints() {
         })
         .collect();
     let mimeapps = sandbox.mimeapps().display().to_string();
+    let kde = sandbox.kde_mimeapps().display().to_string();
     assert_eq!(
         rows,
         vec![
+            (
+                "Default Applications".to_string(),
+                kde.clone(),
+                vec!["nxmproxy.desktop".to_string()]
+            ),
+            (
+                "Added Associations".to_string(),
+                kde.clone(),
+                vec!["gamemodmanager-nxm.desktop".to_string()]
+            ),
             (
                 "Default Applications".to_string(),
                 mimeapps.clone(),
@@ -1390,6 +2107,24 @@ fn list_json_carries_the_resolution_the_terminal_prints() {
                 "Added Associations".to_string(),
                 mimeapps,
                 vec!["gamemodmanager-nxm.desktop".to_string()]
+            ),
+            (
+                "Default Applications".to_string(),
+                sandbox
+                    .data_applications()
+                    .join("kde-mimeapps.list")
+                    .display()
+                    .to_string(),
+                vec!["nxmproxy.desktop".to_string()]
+            ),
+            (
+                "Default Applications".to_string(),
+                sandbox
+                    .data_applications()
+                    .join("mimeapps.list")
+                    .display()
+                    .to_string(),
+                vec!["nxmproxy.desktop".to_string()]
             ),
         ],
         "every declaration, in precedence order, with its group and its file"
@@ -1414,13 +2149,14 @@ fn list_json_carries_the_resolution_the_terminal_prints() {
 
     // And the losing case, which is the one a GUI would get wrong: the payload
     // for a machine where nxmproxy is published and bypassed must say so in the
-    // same structure rather than going quiet.
-    std::fs::write(
-        sandbox.mimeapps(),
-        "[Added Associations]\nx-scheme-handler/nxm=nxmproxy.desktop;\n\n\
-         [Default Applications]\nx-scheme-handler/nxm=gamemodmanager-nxm.desktop;\n",
-    )
-    .unwrap();
+    // same structure rather than going quiet. The bypass goes into the
+    // desktop-specific file, because that is the row above the one nxmproxy
+    // installed itself - writing it only into `mimeapps.list` would leave
+    // nxmproxy winning, which is a different fixture and not this one.
+    let bypassed = "[Added Associations]\nx-scheme-handler/nxm=nxmproxy.desktop;\n\n\
+                    [Default Applications]\nx-scheme-handler/nxm=gamemodmanager-nxm.desktop;\n";
+    std::fs::write(sandbox.mimeapps(), bypassed).unwrap();
+    std::fs::write(sandbox.kde_mimeapps(), bypassed).unwrap();
     let json: serde_json::Value =
         serde_json::from_str(&stdout(&run(&sandbox, &["list", "--json"]))).unwrap();
     assert_eq!(json["owns_scheme"], false);

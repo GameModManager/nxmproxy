@@ -9,6 +9,7 @@
 //! MO2's author's original Windows-only router. See README "Divergences from
 //! upstream" for what was kept, what was fixed, and what was removed.
 
+mod browser;
 mod config;
 mod defaults;
 mod logger;
@@ -83,8 +84,10 @@ enum Command {
     /// make it the handler for `nxm://`. How hard that second half can push
     /// depends on the platform, and `install` never reports more than it did:
     ///
-    /// * Linux - writes one `[Default Applications]` line with `xdg-mime`, and
-    ///   `uninstall` takes that line back out.
+    /// * Linux - writes one `[Default Applications]` line into **every** file
+    ///   the specification's lookup order passes through, desktop-specific
+    ///   (`kde-mimeapps.list` and the rest) and plain alike, and confirms each
+    ///   write by reading it back. `uninstall` takes every one of them out.
     /// * macOS - calls LaunchServices, which on macOS 12+ asks you first.
     /// * Windows - **cannot** choose the default app; no program may. It opens
     ///   the Default Apps page for you instead and exits 3.
@@ -94,11 +97,19 @@ enum Command {
 
     /// Remove nxmproxy as the nxm:// handler, and undo what `install` published.
     ///
-    /// Symmetric with `install`. Linux removes nxmproxy's own
-    /// `[Default Applications]` line and touches no other manager's entry.
+    /// Symmetric with `install`, location for location. Linux removes nxmproxy's
+    /// own id from every `[Default Applications]` line it added and leaves every
+    /// other id, in every other file, exactly where it was; a file that held
+    /// nothing but nxmproxy's own line is removed rather than left empty.
     Uninstall,
 
-    /// Report whether nxmproxy is registered, and who the OS says handles nxm://.
+    /// Report whether nxmproxy is registered, and who opens nxm://.
+    ///
+    /// Three answers, because there are three decisions. The OS's - the whole
+    /// `mimeapps.list` chain including the `$desktop-mimeapps.list` files, which
+    /// is everything `install` can affect - and any browser that decides for
+    /// itself and never asks the OS. A machine can pass the first and fail the
+    /// second, and that is the state a user cannot see from either answer alone.
     Test,
 
     /// Find every mod manager this machine declares, and remember them.
@@ -1093,25 +1104,56 @@ fn handle_test() -> i32 {
     if let Some(caveat) = &status.caveat {
         println!("note: {caveat}");
     }
+    // Everything above is the OS's answer, and the OS is not what decides a link
+    // clicked in a browser. One line per browser that has decided it for
+    // itself, and nothing else: the file to open, and the setting inside it.
+    // `README` has the rest, and the edit is the user's - no program may write
+    // another application's configuration.
+    let overriding = browser_overrides();
+    for over in &overriding {
+        println!(
+            "browser override: {} decides nxm:// for itself: {} ({})",
+            over.browser,
+            over.says,
+            over.source.display()
+        );
+    }
     // Upstream's contract, kept: a non-zero code means "not working". It is no
     // longer the same thing as "not installed", because those are now separable
     // facts:
     //
     //   1  nxmproxy is not even published as a handler
-    //   3  it is published, and nxmproxy still does not hold the scheme
+    //   3  it is published, and something other than nxmproxy still gets the link
     //
     // 3 is `EXIT_NEEDS_USER` for the same reason `install` returns it: nothing
     // failed, the platform allows nothing further, and the remaining step is a
     // click in settings. A caller that only cares whether nxm:// works has a
     // single answer now, and a caller that distinguishes the two cases still
     // can.
+    //
+    // A browser override is 3 and not 0 because exiting 0 over it is the false
+    // green this command exists to end, one level further up than the OS: the
+    // OS would open nxmproxy, and the browser would not.
     if !status.registered {
         platform::EXIT_FAILED
-    } else if resolution.owns() {
+    } else if resolution.owns() && overriding.is_empty() {
         platform::EXIT_OK
     } else {
         platform::EXIT_NEEDS_USER
     }
+}
+
+/// The browsers on this machine that answer for `nxm://` without the OS.
+///
+/// One home, one read. Not logged and not in `list --json`: this is a
+/// diagnostic for a person staring at a link that arrived nowhere, and a GUI
+/// gets the same answer from the line `test` prints rather than a second field
+/// that could disagree with it.
+fn browser_overrides() -> Vec<browser::Override> {
+    std::env::var_os("HOME")
+        .map(std::path::PathBuf::from)
+        .map(|home| browser::overrides(&home))
+        .unwrap_or_default()
 }
 
 /// Compose `install`: publish nxmproxy, claim `nxm://`, and make sure a link

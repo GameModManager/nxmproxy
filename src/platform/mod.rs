@@ -24,16 +24,21 @@
 //! So `install` now claims, and each platform claims only as hard as the OS
 //! allows:
 //!
-//! * **Linux** - one `[Default Applications]` line, written with the same
-//!   `xdg-mime` every other well-behaved tool uses, and removable afterwards.
+//! * **Linux** - writes its own id into **every file** in the `mimeapps.list`
+//!   lookup order, the `$desktop-mimeapps.list` rows included, and reads each
+//!   write back. It took one file at a time until the author watched KDE open
+//!   GameModManager anyway: `~/.config/kde-mimeapps.list` sits above
+//!   `~/.config/mimeapps.list`, and only the lower one was ever written.
 //! * **macOS** - `LSSetDefaultHandlerForURLScheme`, which modern macOS turns
 //!   into a user prompt. The OS asking is the consent step.
 //! * **Windows** - it cannot be done at all, and says so.
 //!
 //! What is still forbidden everywhere: touching **another mod manager's**
-//! entry. Claiming is for *us*. `imp::claim` returns a [`Claim`] so the caller
-//! can tell a script "done" from "one click left", and can never report a win
-//! it did not verify.
+//! entry. Claiming is for *us*. The Linux claim prepends nxmproxy's id to the
+//! ranked list rather than replacing it, so every other application stays
+//! listed, keeps its rank among the others, and comes back byte-for-byte on
+//! `uninstall`. `imp::claim` returns a [`Claim`] so the caller can tell a script
+//! "done" from "one click left", and can never report a win it did not verify.
 
 #[allow(dead_code)]
 pub mod linux;

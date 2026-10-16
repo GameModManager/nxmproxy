@@ -124,6 +124,23 @@ fn mime_types<'a>(groups: &Groups<'a>, group: &str) -> Vec<&'a str> {
     out
 }
 
+/// Does this desktop file declare that it takes nxm links?
+///
+/// The one question `platform::linux::resolve` asks about a desktop id, and it is
+/// **any group**, not `[Desktop Entry]`. The desktop entry specification's
+/// default-application algorithm says a default is only honoured "if a valid
+/// association is found", and an association is a `MimeType` declaration
+/// wherever it sits - which is the real HD2Arsenal entry, whose
+/// `x-scheme-handler/nxm` is under `[Desktop Action Uninstall]` and not under
+/// `[Desktop Entry]` at all. A stricter reader would report that a published,
+/// working handler is not installed, and `test` would then blame the desktop for
+/// a decision the desktop never made.
+pub fn declares_scheme(text: &str) -> bool {
+    groups_of(text)
+        .keys()
+        .any(|group| mime_types(&groups_of(text), group).contains(&NXM_MIME))
+}
+
 /// Parse one desktop file into a manager, if it declares nxm handling.
 ///
 /// **`Exec=` comes from `[Desktop Entry]` and nowhere else** - see
