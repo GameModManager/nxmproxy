@@ -21,22 +21,33 @@
 //!
 //! ## Verification status - READ THIS BEFORE TRUSTING THE macOS PATH
 //!
-//! **This ran on a real Mac.** On macOS 15.7 (arm64) `install` created the
-//! bundle, `lsregister -f` registered it, and a link opened through it reached
-//! the assigned manager byte for byte - space and `&` query string intact. So
-//! the FFI below is no longer written only against Apple's documentation.
+//! **This ran on a real Mac.** On macOS 15.7.9 (arm64) `install` created the
+//! bundle, wrote an `Info.plist` declaring scheme `nxm`, made the `sh` launcher
+//! executable, and `lsregister -f` registered it - the LaunchServices dump
+//! showed it. A link dispatched through the bundle launcher then arrived at the
+//! assigned manager byte for byte, space and `&` query string intact, and the
+//! manager was spawned. The log records each of those steps. So the FFI below is
+//! no longer written only against Apple's documentation.
 //!
-//! **What that did NOT observe is the one thing that matters most:** whether
-//! `LSSetDefaultHandlerForURLScheme` shows its prompt on macOS 12+ and takes
-//! the claim when the user agrees. The bundle was finished by hand through
-//! Finder, which is what `install` tells the user to do. The claim call is
-//! still unobserved by this project.
+//! **What was NOT observed is the last mile: whether LaunchServices offers the
+//! bundle in the chooser on a first click.** The user-facing path exercised
+//! above ends at "you may need to confirm the handler by hand". Nothing here
+//! watched a first click and saw what the chooser did.
 //!
+//! Two steps, and which one does what is worth being exact about. `install()`
+//! is the *publishing* step: it writes the bundle and registers it, and does not
+//! call `LSSetDefaultHandlerForURLScheme`. The claim is step 2 of the command,
+//! in `main.rs`: `handle_install` calls `claim()`, and on macOS `claim()` is
+//! that call. So a prompt can appear during `nxmproxy install`, and what it
+//! does on a real session is not something this repository has observed.
+//!
+//! `install` and `test` both exit 3 here, deliberately and permanently for now.
 //! `current_handler` stays honest about the remaining gap rather than guessing.
 //! The real answer requires `LSCopyDefaultHandlerForURLScheme`, which this fork
 //! does not bind; the record is `~/Library/Preferences/com.apple.LaunchServices/com.apple.launchservices.secure.plist`,
 //! a binary plist we do not parse. So `test` reports "unknown" and says where
-//! to look, rather than inventing a boolean, and `install` still exits 3.
+//! to look, rather than inventing a boolean, and `resolve()` returns an empty
+//! chain rather than a guess that would read as a working install.
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
