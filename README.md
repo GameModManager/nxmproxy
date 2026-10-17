@@ -86,8 +86,9 @@ Every item here is a deliberate change, with the reason.
   published as a **versioned contract** third parties can implement against.
   See "Delivering to an already-running manager".
 * **Tests and CI.** Upstream had no tests at all.
-* **A release pipeline** producing one static Linux binary, the licence and the
-  checksum. See "The Linux binary".
+* **A release pipeline** producing a static Linux binary and a universal macOS
+  binary, each holding the executable and nothing else. See "The release
+  binaries".
 
 ### Changed: `install` now claims the scheme, and says whether it worked
 
@@ -201,9 +202,72 @@ arrives byte for byte.
 
 ## Installation and registration
 
+### Getting the binary
+
+| Platform | What you download | Where |
+| --- | --- | --- |
+| Linux x86_64 | `nxmproxy-<version>-linux-x86_64` | A static, musl-linked binary. No dependency at all - it runs on any distribution of any age |
+| **macOS, Intel or Apple silicon** | `nxmproxy-<version>-macos-universal.tar.gz` | One Mach-O holding **both** `arm64` and `x86_64`. Unpack it anywhere |
+| Windows | - | Not shipped. `cargo build --release --target x86_64-pc-windows-msvc`, and see the honest status on the Windows path below |
+
+Both release assets are attached to the [GitHub release](https://github.com/GameModManager/nxmproxy/releases)
+and also uploaded as workflow artifacts by every run. To build either yourself,
+`cargo build --release` is enough on any of the three platforms.
+
+```sh
+# Linux
+install -m 755 nxmproxy-<version>-linux-x86_64 /usr/local/bin/nxmproxy
+
+# macOS
+tar xzf nxmproxy-<version>-macos-universal.tar.gz
+install -m 755 nxmproxy /usr/local/bin/nxmproxy
+```
+
+**Put the binary somewhere permanent before running `install`.** This is not a
+styling note. `install` records the absolute path of the executable it was run
+from and writes it into the desktop entry (Linux) or the bundle's launcher
+(macOS), so an install from a downloaded file in `~/Downloads` keeps working
+only for as long as that file stays exactly where it was.
+
+**On macOS, the binary is not signed.** A release asset here is the raw
+executable: no Developer ID, no notarization, no `.dmg` to put a window around
+a command-line tool. macOS Gatekeeper assesses an unsigned binary as a refusal -
+measured, not assumed: `spctl --assess --type execute` on the built binary
+returns `rejected`, exit 3, the same answer it gives an unsigned binary built
+from any other project. A file that arrived through a browser also carries the
+`com.apple.quarantine` attribute. If macOS refuses to run it, that is
+Gatekeeper and not a broken build:
+
+```sh
+xattr -dr com.apple.quarantine nxmproxy     # or: right-click > Open, once
+```
+
+Both are ordinary for an unsigned build and neither is a workaround for
+anything broken. What was actually observed on a real Mac: the universal binary
+**ran** with the quarantine attribute set and ran after it was cleared, so on
+this machine it was never the thing standing in the way - but the assessment is
+a refusal, and on a stricter or differently configured machine it may be the
+dialog a user sees. The one-line remedy is here either way.
+
+> **What "universal" is checked against.** The release job does not just build
+> the two slices and hope: `lipo -verify_arch x86_64 arm64` has to pass on the
+> file unpacked out of the *tarball*, `otool -L` has to show nothing linked
+> from outside `/System/Library` and `/usr/lib`, and then both slices are run
+> with `arch -x86_64` and `arch -arm64`, so the Intel half is executed on the
+> build runner rather than assumed from a successful `cargo build`.
+
+### What `install` does
+
 `nxmproxy install` is three steps in one command: publish nxmproxy to the OS,
 take the `nxm://` scheme, and make sure a link has somewhere to go. Each step
 fails independently and the exit code is the worst of them.
+
+**`install` exits 3 on macOS and on Windows, always, and that is not a bug.** It
+means *published, and one step is left that you must do by hand*. On those two
+platforms nxmproxy cannot read the claim back, so reporting exit 0 would be a
+program asserting something it does not know. A wrapper script that treats 3 as
+success is written correctly; one that treats 0 as success automates an install
+that may route nothing.
 
 ### Linux
 
@@ -249,7 +313,7 @@ that held nothing but nxmproxy's own line is removed rather than left with an
 empty `[Default Applications]` header. Because the claim is a prepend, the
 inverse is exact: a file's previous bytes come back byte for byte.
 
-### macOS - UNVERIFIED, and it says so
+### macOS - verified by hand on a real Mac, and still partly unverifiable
 
 `install` publishes a minimal `.app` bundle whose `Info.plist` declares `nxm`,
 then calls **`LSSetDefaultHandlerForURLScheme`**, which on macOS 12 and later
@@ -262,13 +326,35 @@ exists to stop. That was right about the method and wrong about the outcome: it
 left the bundle eligible and unchosen, so `install` reported success over an
 install that routed nothing.
 
-> **Honest status - read before trusting the macOS path.** The FFI was written
-> against Apple's documentation, **not on a Mac**. What CI proves is that it
-> compiles against the SDK and links against CoreFoundation and CoreServices.
-> What nothing proves is what it does: whether the prompt appears, whether it
-> takes the claim when the user agrees, and what `test` reports on a machine
-> where something else already owns `nxm://`. Because the call cannot be read
-> back, `install` **never** reports a verified claim on macOS and always exits 3.
+> **Honest status.** The FFI was originally written against Apple's
+> documentation without ever running on a Mac. That is no longer true, and what
+> was actually executed on a real GUI Mac (macOS 15.7, arm64, 2026-10-17) is:
+>
+> * `install` creates
+>   `~/Library/Application Support/nxmproxy/NXMProxy.app`, with
+>   `Contents/MacOS/NXMProxy` (the `sh` launcher, mode 0755) and a
+>   `Contents/Info.plist` whose `CFBundleURLTypes` declares scheme `nxm`, role
+>   `Viewer`.
+> * `lsregister -f` registers it: `lsregister -dump` shows 18 references to
+>   `org.gamemodmanager.nxmproxy`.
+> * A link opened through the bundle arrives at the assigned manager **byte for
+>   byte**. The query string keeps its space and its `&`, which is the
+>   quote-preservation property this fork exists to have, checked end to end
+>   rather than only against a recorded `argv`.
+> * The log records `route domain=... manager=... result=routed` and then
+>   `spawn result=started`.
+> * `install` **exits 3**, as it says it will.
+>
+> **What that verification did not cover, and still is not covered:**
+>
+> * **The claim itself was not observed.** The bundle was finished by hand
+>   through Finder - Get Info, Open with, Change All - which is the documented
+>   route and the one `install` prints. Whether
+>   `LSSetDefaultHandlerForURLScheme` shows its prompt on macOS 12+ and takes
+>   the claim when the user agrees is still unobserved by this repository.
+> * **The default handler is still unreadable.** `LSCopyDefaultHandlerForURLScheme`
+>   is not bound, so `test` reports unknown rather than guessing, and `install`
+>   still exits 3. Unchanged by the above, and not changing here.
 >
 > **CI found the API is not merely unverified - it is hostile.** On the headless
 > `macos-latest` runner, `LSSetDefaultHandlerForURLScheme` **aborts the process**
@@ -288,9 +374,11 @@ install that routed nothing.
 >   prints a note when it happens. Every other assertion that would have needed
 >   a post-install state was moved to a test that runs on Linux and Windows
 >   instead, or re-expressed through `list --json`, which never calls `install`.
->   So **the macOS install path is not covered end to end**, and this README
->   does not claim it is. The assertion that still runs on macOS is the one that
->   matters most: nxmproxy never reports a claim it cannot verify.
+>   So **the macOS install path is still not covered end to end by the suite**,
+>   and this README does not claim it is. What covers it instead is the manual
+>   run above, and CI, which now executes the binary's read-only subcommands on
+>   every push. The assertion that still runs on macOS in the suite is the one
+>   that matters most: nxmproxy never reports a claim it cannot verify.
 
 `nxmproxy test` cannot report the current default handler without
 `LSCopyDefaultHandlerForURLScheme`, which this fork does not bind, so `test`
@@ -822,23 +910,40 @@ Every CLI test runs in a throwaway config directory and a throwaway
 
 ### CI
 
-`.github/workflows/ci.yml` **builds**. It runs `cargo fmt --check`,
-`clippy -D warnings` and `cargo build --release` on **Linux, macOS and
-Windows**, and that is all. It does not run the tests: the suite lives in the
-repo and `cargo test` runs all of it, but running it on every commit on three
-platforms costs minutes and tells the author things they can see in five
-seconds on their own machine. Local verification is the author's job; CI exists
-for the one thing a single machine cannot do, which is proving the crate
-compiles everywhere at once.
+`.github/workflows/ci.yml` **builds**, and on macOS it also **runs** the binary.
+It runs `cargo fmt --check`, `clippy -D warnings` and `cargo build --release` on
+**Linux, macOS and Windows**. On the macOS runner only, it then executes
+`--version`, `--help`, `list` and `list --json` against the release build. It
+does not run the test suite: the suite lives in the repo and `cargo test` runs
+all of it, but running it on every commit on three platforms costs minutes and
+tells the author things they can see in five seconds on their own machine. Local
+verification is the author's job; CI exists for the two things a single machine
+cannot do, which are proving the crate compiles everywhere at once, and proving
+the macOS binary **starts** on a platform nobody can hand-test before shipping.
 
-**The trade, stated plainly.** This job used to end with `cargo test` and a CLI
-smoke test, and both of those *executed the built binary* - on macOS and Windows
-as well as on Linux. That was the only run-check nxmproxy's binary ever got on
-those two platforms, and it is given up on purpose. macOS and Windows are
-**compile-only** from here: a change that compiles there but misbehaves when
-run is not caught here. That is the accepted cost of not spending minutes per
-commit, and it is why the claims below are marked unverified rather than
-tested.
+**The trade, restated honestly.** This job used to end with `cargo test` and a
+CLI smoke test, and both of those *executed the built binary* on all three
+platforms, because running the **tests** there killed two of them. Those two
+things are different decisions and only the first is still given up:
+
+| Given up on purpose | Not given up |
+| --- | --- |
+| Running the 136-test suite on three platforms per commit. It costs minutes and tells the author nothing they cannot see locally in seconds | Executing the binary at all, on macOS. Once macOS is a platform users download, "it compiles" is a weaker claim than "it starts" |
+
+So **Windows remains compile-only** - a change that compiles there but misbehaves
+when run is not caught here - and that asymmetry is deliberate rather than
+overlooked. Windows is not shipped, so a run-check there buys nothing a user
+would notice; macOS is shipped, so a broken macOS binary reaches people. The
+macOS step costs about a second.
+
+> **`install` is never run in CI, and adding it would break the job.** It calls
+> `LSSetDefaultHandlerForURLScheme`, which on a runner with no GUI session
+> **aborts the process** - killed by a signal, so the step cannot even report a
+> clean failure. The four subcommands CI does run are safe for a checkable
+> reason, not because they look harmless: none of them reaches
+> `platform::imp::claim()`, which is the only call site of that FFI in the
+> crate. The workflow carries this warning in a comment next to the step, aimed
+> at whoever next thinks a smoke test should be more thorough.
 
 > **What the CI build proves on macOS and Windows, precisely:** the crate
 > compiles there, and every load-bearing decision in it is pure - the platform
@@ -870,16 +975,19 @@ tested.
 >   Linux build can see because the function is `#[cfg(windows)]`, and would
 >   have failed to compile for every Windows user.
 
-### The Linux binary
+### The release binaries
 
-`.github/workflows/release.yml` builds a release artifact. It is triggered by
+`.github/workflows/release.yml` builds the release artifacts. It is triggered by
 pushing a tag matching `v*`; it does not create tags, and a manual run
-(`workflow_dispatch`) builds the same artifact and uploads it **without**
+(`workflow_dispatch`) builds the same artifacts and uploads them **without**
 publishing a release, so the pipeline can be proved before anyone cuts a
 version.
 
 ```sh
 cargo build --release --target x86_64-unknown-linux-musl
+cargo build --release --target aarch64-apple-darwin
+cargo build --release --target x86_64-apple-darwin
+lipo -create target/{aarch64,x86_64}-apple-darwin/release/nxmproxy -output dist/nxmproxy
 ```
 
 **Static, musl, not glibc.** The glibc build of this crate links
@@ -896,9 +1004,43 @@ artifact inside a container that has **no glibc at all** (`alpine`,
 binary that runs, and the whole point of shipping one is that it runs on a
 machine the author has never seen.
 
-Each release carries `LICENSE.md` and `NOTICE.md` beside the binary and states
-the licence and upstream attribution in its notes, because GPL-3 obligations
-travel with a distributed binary and upstream's credit is part of this fork.
+### The macOS binary: one file, both architectures
+
+Apple silicon is not the only Mac, and an arm64-only release would leave every
+Intel user with a file they cannot execute and a source tree they have to
+rebuild from. So the macOS job builds **both** `aarch64-apple-darwin` and
+`x86_64-apple-darwin` from the same commit and joins them with `lipo` into one
+Mach-O. One asset, one download, either Mac - and no chance of a user grabbing
+the wrong one, because there is no wrong one.
+
+It ships as a plain `.tar.gz` holding the bare binary. No `.dmg`, no installer,
+no drag-to-Applications icon: `install` builds the `NXMProxy.app` bundle itself,
+and wrapping a command-line tool in a disk image would be packaging theatre.
+That also means **the binary is unsigned and un-notarized**, which has a
+concrete cost - Gatekeeper refuses an unsigned binary, and a browser-downloaded
+copy arrives with `com.apple.quarantine`. The remedy is one command, and
+"Getting the binary" above says which. Notarization needs a paid Apple Developer
+ID; a GPL command-line project does not have one.
+
+The universal build is checked the same way the Linux one is, and each check was
+confirmed to actually go red before it was trusted:
+
+| Check | What it would catch |
+| --- | --- |
+| `lipo -verify_arch x86_64 arm64` on the file unpacked **out of the tarball** | A missing slice. Confirmed to exit non-zero against a thin arm64 build and a thin x86_64 build |
+| `otool -L`, refusing any dependency outside `/System/Library` and `/usr/lib` | A library the user does not have - the macOS form of the Linux job's `ldd` check. Confirmed to fire against a binary linked to a hand-built dylib. The shipped binary links only CoreFoundation, CoreServices, `libiconv` and `libSystem` |
+| `arch -x86_64` and `arch -arm64` on the fat binary | An Intel slice that compiles but does not start. Both halves are **executed**, not assumed from a successful build |
+
+### The licence, and why `dist/` holds nothing else
+
+Neither job puts anything in the archive but the binary. GPL-3 obligations do
+travel with a distributed binary, and upstream's credit is part of this fork,
+but all of that is satisfied by the repository: `LICENSE.md` is upstream's text
+kept verbatim, `NOTICE.md` states what was kept, fixed and removed, and the
+attribution is in every release's changelog section, which is what the release
+page shows. GitHub already records a SHA-256 digest for every uploaded asset, so
+a `SHA256SUMS` file would be a second copy of it, and a release asset is
+permanent storage.
 
 ### Negative controls
 

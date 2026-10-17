@@ -1,5 +1,73 @@
 # Changelog
 
+## Unreleased
+
+**macOS is now shipped.** A release carries a
+`nxmproxy-<version>-macos-universal.tar.gz` next to the Linux binary: one Mach-O
+with **both** `arm64` and `x86_64` in it, built from the same commit, same
+lockfile and same profile, joined with `lipo`. Intel users are not left to
+rebuild from source, and a user does not have to know which Mac they have
+before choosing what to download.
+
+The tarball holds the bare binary and nothing else - no `.dmg`, no installer, no
+`Info.plist` - because nxmproxy is a command-line tool and `install` builds the
+`NXMProxy.app` bundle itself. That also means **the archive is not code signed
+and not notarized**, which has a cost worth naming: Gatekeeper assesses an
+unsigned binary as a refusal (`spctl --assess --type execute` returns
+`rejected`, exit 3), and a copy that came from a browser arrives with
+`com.apple.quarantine` set. After unpacking, either
+
+```sh
+xattr -dr com.apple.quarantine nxmproxy
+```
+
+or right-click the file and choose **Open** once. Notarization would need a paid
+Apple Developer ID; a repository that ships a GPL command-line tool does not
+have one.
+
+### Changed
+
+* **CI now runs the macOS binary instead of only building it.** `--version`,
+  `--help` and `list` are executed on every push, which is the cheapest check
+  that is honest: a binary that links is not a binary that starts. `install` is
+  still never run in CI and never will be - `LSSetDefaultHandlerForURLScheme`
+  aborts the process on a runner with no GUI session - and the workflow says so
+  in a comment aimed at the next person.
+* The CI trade, restated honestly: running the **test suite** on three
+  platforms per commit is still given up, because it costs minutes and the
+  author sees failures in seconds. What is no longer given up is executing the
+  binary at all, now that macOS is a platform users download rather than one
+  that merely has to compile.
+
+### Verified
+
+Checked on a real GUI Mac (macOS 15.7, arm64), not inferred:
+
+* `cargo build --release` and `cargo test` are clean: **136/136** (119 unit, 17
+  integration).
+* The universal binary is `arm64` + `x86_64` (`lipo -info`), and **both slices
+  execute**: `arch -x86_64` and `arch -arm64` on the same fat binary both print
+  the version. The arm64 slice is ad-hoc signed by the linker, the x86_64 slice
+  carries no signature at all, and both run.
+* It links only what macOS ships: CoreFoundation, CoreServices, `libiconv`,
+  `libSystem` - nothing from Homebrew, nothing relative.
+* `install` end to end on a real session: it creates
+  `~/Library/Application Support/nxmproxy/NXMProxy.app`, registers it through
+  `lsregister -f`, and a link opened through the bundle arrives at the manager
+  **byte for byte**, spaces and `&` query strings intact.
+
+### Still unverified, and still not claimed
+
+* **The default handler cannot be read back.** `LSCopyDefaultHandlerForURLScheme`
+  is not bound, so `test` reports unknown rather than guessing, and `install`
+  **still exits 3** on macOS. That has not changed and is not changing here.
+* Whether the `LSSetDefaultHandlerForURLScheme` prompt appears on macOS 12+ and
+  takes the claim when the user agrees is still not something this repository
+  can observe. It was **not** observed on the real Mac either: that run
+  exercised the bundle and the registration, and the claim was finished by hand
+  through Finder, which is the documented route and the one `install` prints.
+* The Windows named-pipe fast path has still never been executed anywhere.
+
 ## 0.3.0
 
 Second tagged release of this fork of

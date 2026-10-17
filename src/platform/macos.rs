@@ -21,21 +21,22 @@
 //!
 //! ## Verification status - READ THIS BEFORE TRUSTING THE macOS PATH
 //!
-//! **The FFI below was written against Apple's documentation, not against a
-//! Mac.** It is three declarations: `CFStringCreateWithCString` and
-//! `CFRelease` from CoreFoundation, and `LSSetDefaultHandlerForURLScheme` from
-//! LaunchServices. What CI proves is that it compiles against the macOS SDK
-//! and links against the two system frameworks. What **nothing** proves is
-//! what it does: whether macOS shows the prompt, whether it takes the claim
-//! when the user says yes, whether `Alternate` rank still influences the
-//! chooser, or what `test` reports on a machine where something else already
-//! owns `nxm://`. Those need a real Mac and a real click.
+//! **This ran on a real Mac.** On macOS 15.7 (arm64) `install` created the
+//! bundle, `lsregister -f` registered it, and a link opened through it reached
+//! the assigned manager byte for byte - space and `&` query string intact. So
+//! the FFI below is no longer written only against Apple's documentation.
 //!
-//! `current_handler` stays honest about the gap rather than guessing. The real
-//! answer requires `LSCopyDefaultHandlerForURLScheme`, which this fork does not
-//! bind; the record is `~/Library/Preferences/com.apple.LaunchServices/com.apple.launchservices.secure.plist`,
+//! **What that did NOT observe is the one thing that matters most:** whether
+//! `LSSetDefaultHandlerForURLScheme` shows its prompt on macOS 12+ and takes
+//! the claim when the user agrees. The bundle was finished by hand through
+//! Finder, which is what `install` tells the user to do. The claim call is
+//! still unobserved by this project.
+//!
+//! `current_handler` stays honest about the remaining gap rather than guessing.
+//! The real answer requires `LSCopyDefaultHandlerForURLScheme`, which this fork
+//! does not bind; the record is `~/Library/Preferences/com.apple.LaunchServices/com.apple.launchservices.secure.plist`,
 //! a binary plist we do not parse. So `test` reports "unknown" and says where
-//! to look, rather than inventing a boolean.
+//! to look, rather than inventing a boolean, and `install` still exits 3.
 
 use std::path::{Path, PathBuf};
 use std::process::Command;

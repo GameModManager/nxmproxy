@@ -3,12 +3,14 @@
 
 name: CI
 
-# CI's job is to BUILD. Tests are run by whoever changes the code, on their own
-# machine, where a failure is a two-second iteration rather than a queue. The
-# suite is not deleted - `cargo test` runs all of it - it is simply not run here
-# on every commit. What remains is what only CI can do: compile the crate on
-# Linux, macOS and Windows at the same time, with warnings as errors, so a
-# change that is Unix-only by accident never reaches a user.
+# CI's job is to BUILD, and to prove the macOS binary STARTS. The tests are run
+# by whoever changes the code, on their own machine, where a failure is a
+# two-second iteration rather than a queue. The suite is not deleted - `cargo
+# test` runs all of it - it is simply not run here on every commit. What remains
+# is what only CI can do: compile the crate on Linux, macOS and Windows at the
+# same time, with warnings as errors, so a change that is Unix-only by accident
+# never reaches a user, and run the macOS binary through the subcommands that
+# are safe on a runner with no GUI session.
 on:
   push:
     branches: [main]
@@ -55,10 +57,45 @@ jobs:
       #
       # THE TRADE, stated plainly. This job used to end with `cargo test` and a
       # CLI smoke test, and both of those EXECUTED the built binary - on macOS
-      # and Windows as well as on Linux. That was the only run-check the binary
-      # ever got on those two platforms. It is deliberately given up: CI builds,
-      # whoever changed the code runs it. So macOS and Windows are compile-only
-      # from here, and a change that compiles there but misbehaves when run is
-      # not caught here. Named rather than quietly dropped.
+      # and Windows as well as on Linux. Running the *tests* is still given up:
+      # the suite costs minutes per commit on three platforms and tells the
+      # author nothing they cannot see in five seconds locally. Executing the
+      # binary at all is no longer given up, because macOS is now shipped and
+      # "it compiles" is a weaker claim than "it starts".
       - name: Build
         run: cargo build --release
+
+      # macOS only, and this is the cheapest check that is actually honest:
+      # a binary that links is not a binary that starts, and on macOS those
+      # are different facts. Both slices are built by the release job; here the
+      # runner's native one is enough, and building x86_64 as well would double
+      # the slowest step of this job to check something release.yml already
+      # checks with `arch -x86_64` on a fat binary.
+      #
+      # NEVER run `nxmproxy install` in this workflow, or any workflow, or add
+      # it "just to be thorough". `install` calls
+      # LSSetDefaultHandlerForURLScheme, which needs a GUI session a runner does
+      # not have, and on the headless `macos-latest` runner that call **ABORTS
+      # THE PROCESS** - killed by a signal, not an error return, so the step
+      # cannot even fail cleanly. That is not a hypothesis: the first CI run
+      # proved it, two integration tests died and a unit test took the whole
+      # test binary down with SIGTRAP before printing a test name.
+      #
+      # `--version`, `--help` and `list` are the only subcommands proven safe
+      # here, and each is safe for a specific reason rather than by being
+      # harmless-looking: none of them reaches `platform::imp::claim()`, which
+      # is the only call site of that FFI in the crate, and `list` on a bare
+      # runner reads an empty configuration and exits 0.
+      #
+      # A throwaway config directory anyway, because `list` creates its
+      # directory and log on first run and a CI runner has no business writing
+      # into a real $HOME even if the runner is disposable.
+      - name: Run it
+        if: runner.os == 'macOS'
+        env:
+          NXMPROXY_CONFIG_DIR: ${{ runner.temp }}/nxmproxy-ci
+        run: |
+          ./target/release/nxmproxy --version
+          ./target/release/nxmproxy --help > /dev/null
+          ./target/release/nxmproxy list
+          ./target/release/nxmproxy list --json > /dev/null
