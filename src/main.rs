@@ -6,8 +6,8 @@
 //! registration is the only thing that persists.
 //!
 //! Provenance: a fork of https://github.com/TanninOne/nxmproxy (GPL-3.0),
-//! MO2's author's original Windows-only router. See README "Divergences from
-//! upstream" for what was kept, what was fixed, and what was removed.
+//! MO2's author's original Windows-only router. See NOTICE.md for what was
+//! kept, what was fixed, and what was removed.
 
 mod browser;
 mod config;
@@ -850,7 +850,7 @@ fn games_of(config: &Config, id: &str) -> Vec<String> {
         .collect()
 }
 
-/// The routing table, in the shape the README documents:
+/// The routing table, as the `*` lines mean it:
 ///
 /// ```text
 /// mod managers:
@@ -1109,8 +1109,8 @@ fn handle_test() -> i32 {
     // Everything above is the OS's answer, and the OS is not what decides a link
     // clicked in a browser. One line per browser that has decided it for
     // itself, and nothing else: the file to open, and the setting inside it.
-    // `README` has the rest, and the edit is the user's - no program may write
-    // another application's configuration.
+    // `README` says the same in one line, and the edit is the user's - no
+    // program may write another application's configuration.
     let overriding = browser_overrides();
     for over in &overriding {
         println!(

@@ -1,5 +1,18 @@
 # Changelog
 
+## 0.4.0
+
+Third tagged release of this fork of [NXMProxy](https://github.com/TanninOne/nxmproxy) by Tanner Parnell, Copyright (c) 2021 Tanner Parnell, GPL-3.0-or-later. See `NOTICE.md` for what was kept, what was fixed and what was removed, and `LICENSE.md` for the licence text.
+
+- Release: a universal macOS binary ships beside the Linux one, `nxmproxy-<version>-macos-universal.tar.gz`, one Mach-O holding both `arm64` and `x86_64` so Intel users are not stranded.
+- Release: the macOS asset is a `.tar.gz` of the bare binary - no `.dmg`, no installer, no code signing, no notarization.
+- Release: the macOS job checks the universal binary before attaching it, with `lipo -verify_arch`, `otool -L`, and both slices executed through `arch`.
+- CI: the macOS job now runs the binary (`--version`, `--help`, `list`, `list --json`) instead of only building it.
+- CI: `nxmproxy install` is still never run there - `LSSetDefaultHandlerForURLScheme` aborts the process on a runner with no GUI session - and the workflow says so next to the step.
+- macOS: the default handler still cannot be read back, so `install` still exits 3 there and leaves one step to you by hand.
+- Docs: `README.md` rewritten around what the tool does for a user.
+- Docs: this changelog is one line per change from here on.
+
 ## 0.3.0
 
 Second tagged release of this fork of
