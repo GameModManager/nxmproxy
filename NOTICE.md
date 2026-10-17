@@ -33,10 +33,11 @@ a user copies the vector out of a desktop entry and does not type a separator.
 
 ### What changed
 
-See "Divergences from upstream" in `README.md` for the full table with reasons.
-In summary: upstream crashed on an unconfigured link and on a corrupt config,
-mangled any link containing a quote, seized the `nxm://` scheme through
-`HKEY_CLASSES_ROOT` with self-elevation, and compiled only on Windows.
+The full table, with the reason for every item, is in this repository's history:
+it was in `README.md` under "Divergences from upstream" until the README was
+rewritten for users. In summary: upstream crashed on an unconfigured link and on
+a corrupt config, mangled any link containing a quote, seized the `nxm://` scheme
+through `HKEY_CLASSES_ROOT` with self-elevation, and compiled only on Windows.
 
 This fork fixes all of those, adds Linux and macOS support, and adds tests and
 CI. It is a genuine broker and does not require GameModManager or any other
@@ -57,6 +58,10 @@ output of `list` is intentionally not coupled to any GameModManager schema.
 
 ## Third-party dependencies
 
-See the "Licence and dependencies" table in `README.md`. Every crate is
-permissive except `option-ext` (MPL-2.0), which is used unmodified and
-transitively through `directories`.
+Every direct and transitive dependency is permissive except `option-ext`
+(MPL-2.0), which is used unmodified and transitively through `directories`.
+It is the only weak-copyleft crate in the tree, and MPL-2.0 applies at file
+level, so distributing the binary does not impose its terms on this project.
+The full list with versions and licences was in `README.md` under "Licence and
+dependencies" until the README was rewritten for users; `Cargo.toml` names
+every direct dependency, and the lockfile pins the rest.
